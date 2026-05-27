@@ -112,6 +112,34 @@ function getRandomHermesNote() {
   return HERMES_LEARNING_NOTES[idx];
 }
 
+// ─── Voice Note Helpers ────────────────────────────────────────────────────────
+async function getVoiceBuffer(fileId) {
+  const fileLink = await bot.getFileLink(fileId);
+  const res = await fetch(fileLink);
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+async function transcribeAudio(audioBuffer) {
+  if (!googleGenAI) {
+    throw new Error("GEMINI_API_KEY no está configurada para transcripción.");
+  }
+  const model = googleGenAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  
+  const result = await model.generateContent([
+    {
+      inlineData: {
+        data: audioBuffer.toString("base64"),
+        mimeType: "audio/ogg"
+      }
+    },
+    "Transcribe este audio con absoluta precisión. Devuelve ÚNICAMENTE el texto de la transcripción, sin introducciones ni explicaciones de ningún tipo."
+  ]);
+  
+  return result.response.text().trim();
+}
+
+
 // ─── Plan A: Model Configurations & Hardcoded Pricing (per 1M tokens) ──────────
 const MODELS_CONFIG = {
   "qwen/qwen3.7-max": {
@@ -551,34 +579,9 @@ bot.onText(/\/status/, async (msg) => {
 
 // ─── Main message handler ─────────────────────────────────────────────────────
 bot.on("message", async (msg) => {
-  if (msg.text && msg.text.startsWith("/")) return;
-  if (!msg.text) {
-    bot.sendMessage(msg.chat.id, "📝 Por el momento solo puedo procesar mensajes de texto.");
-    return;
-  }
-
   const chatId   = msg.chat.id;
   const userId   = msg.from.id;
   const username = msg.from.username || msg.from.first_name;
-
-  // Interceptar botones persistentes de menú táctil
-  if (msg.text === "🤖 Seleccionar Modelo") {
-    await showModelPanel(chatId);
-    return;
-  }
-  if (msg.text === "✅ Comprobar Conexión") {
-    await runStatusCheck(chatId);
-    return;
-  }
-  if (msg.text === "🔄 Limpiar Historial") {
-    await saveHistory(chatId, []);
-    bot.sendMessage(chatId, "🔄 *Conversación restablecida.*\nHistorial limpiado. ¡Empecemos de cero!", { parse_mode: "Markdown" });
-    return;
-  }
-  if (msg.text === "🔧 Menú de Ayuda") {
-    showHelp(chatId);
-    return;
-  }
 
   // Auth check
   if (!isAllowed(userId)) {
@@ -587,14 +590,78 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  console.log(chalk.cyan(`[MSG] @${username} → ${msg.text.substring(0, 60)}${msg.text.length > 60 ? "..." : ""}`));
+  // Interceptar botones persistentes de menú táctil
+  if (msg.text) {
+    if (msg.text.startsWith("/")) return;
+    if (msg.text === "🤖 Seleccionar Modelo") {
+      await showModelPanel(chatId);
+      return;
+    }
+    if (msg.text === "✅ Comprobar Conexión") {
+      await runStatusCheck(chatId);
+      return;
+    }
+    if (msg.text === "🔄 Limpiar Historial") {
+      await saveHistory(chatId, []);
+      bot.sendMessage(chatId, "🔄 *Conversación restablecida.*\nHistorial limpiado. ¡Empecemos de cero!", { parse_mode: "Markdown" });
+      return;
+    }
+    if (msg.text === "🔧 Menú de Ayuda") {
+      showHelp(chatId);
+      return;
+    }
+  }
+
+  let textToProcess = msg.text;
+
+  // ─── Voice Note Handler ──────────────────────────────────────────────────────
+  if (msg.voice) {
+    const voiceMsg = await bot.sendMessage(chatId, "🎤 _Descargando y escuchando tu nota de voz..._");
+    try {
+      bot.sendChatAction(chatId, "record_voice");
+      const audioBuffer = await getVoiceBuffer(msg.voice.file_id);
+      
+      const transcription = await transcribeAudio(audioBuffer);
+      
+      if (!transcription || transcription.length === 0) {
+        await bot.editMessageText("❌ No pude entender nada en el audio. Por favor, habla más claro o acércate al micrófono.", {
+          chat_id: chatId,
+          message_id: voiceMsg.message_id
+        });
+        return;
+      }
+      
+      await bot.editMessageText(`🎤 *Transcripción:* _"${transcription}"_`, {
+        chat_id: chatId,
+        message_id: voiceMsg.message_id,
+        parse_mode: "Markdown"
+      });
+      
+      textToProcess = transcription;
+    } catch (err) {
+      console.error(chalk.red(`[VOICE ERR] ${err.message}`));
+      await bot.editMessageText(`❌ *Error al transcribir audio:*\n\`${err.message}\``, {
+        chat_id: chatId,
+        message_id: voiceMsg.message_id,
+        parse_mode: "Markdown"
+      });
+      return;
+    }
+  }
+
+  if (!textToProcess) {
+    bot.sendMessage(chatId, "📝 Por el momento solo puedo procesar mensajes de texto y notas de voz.");
+    return;
+  }
+
+  console.log(chalk.cyan(`[MSG] @${username} → ${textToProcess.substring(0, 60)}${textToProcess.length > 60 ? "..." : ""}`));
 
   // Show typing indicator
   bot.sendChatAction(chatId, "typing");
   const typingInterval = setInterval(() => bot.sendChatAction(chatId, "typing"), 4500);
 
   try {
-    const reply = await askAI(chatId, msg.text);
+    const reply = await askAI(chatId, textToProcess);
     clearInterval(typingInterval);
 
     // Telegram message chunking (max 4096 chars)
