@@ -577,6 +577,58 @@ bot.onText(/\/status/, async (msg) => {
   await runStatusCheck(msg.chat.id);
 });
 
+// ─── Robust message sending ───────────────────────────────────────────────────
+async function safeSendMessage(chatId, text) {
+  try {
+    if (text.length <= 4096) {
+      await bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
+    } else {
+      const chunks = text.match(/[\s\S]{1,4000}/g) || [text];
+      for (const chunk of chunks) {
+        await bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+      }
+    }
+  } catch (err) {
+    if (err.message && err.message.includes("can't parse entities")) {
+      console.warn("Markdown parsing failed, falling back to plain text...");
+      if (text.length <= 4096) {
+        await bot.sendMessage(chatId, text);
+      } else {
+        const chunks = text.match(/[\s\S]{1,4000}/g) || [text];
+        for (const chunk of chunks) {
+          await bot.sendMessage(chatId, chunk);
+        }
+      }
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ─── HTML Document Extractor and Sender ──────────────────────────────────────
+const fs = require("fs");
+const path = require("path");
+
+async function handleHTMLExtraction(chatId, replyText) {
+  const regex = /```html\s*([\s\S]*?)```/i;
+  const match = replyText.match(regex);
+  if (match && match[1]) {
+    const htmlContent = match[1].trim();
+    const dateStr = new Date().toISOString().split("T")[0];
+    const filename = `Ficha_Hiperenfoque_${dateStr}.html`;
+    const tempPath = path.join(__dirname, filename);
+    
+    try {
+      fs.writeFileSync(tempPath, htmlContent, "utf8");
+      await bot.sendMessage(chatId, "📄 *He compilado tu Ficha HTML interactiva en un documento descargable. ¡Aquí lo tienes!*", { parse_mode: "Markdown" });
+      await bot.sendDocument(chatId, tempPath, {}, { filename });
+      fs.unlinkSync(tempPath);
+    } catch (err) {
+      console.error("Error al generar o enviar archivo HTML:", err.message);
+    }
+  }
+}
+
 // ─── Main message handler ─────────────────────────────────────────────────────
 bot.on("message", async (msg) => {
   const chatId   = msg.chat.id;
@@ -664,15 +716,11 @@ bot.on("message", async (msg) => {
     const reply = await askAI(chatId, textToProcess);
     clearInterval(typingInterval);
 
-    // Telegram message chunking (max 4096 chars)
-    if (reply.length <= 4096) {
-      await bot.sendMessage(chatId, reply, { parse_mode: "Markdown" });
-    } else {
-      const chunks = reply.match(/[\s\S]{1,4000}/g) || [reply];
-      for (const chunk of chunks) {
-        await bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
-      }
-    }
+    // Safe, robust message chunking and delivery
+    await safeSendMessage(chatId, reply);
+    
+    // Automatically compile and deliver HTML code blocks as downloadable files
+    await handleHTMLExtraction(chatId, reply);
 
     console.log(chalk.green(`[OK]  Respondido (${reply.length} caracteres)`));
 
@@ -691,7 +739,7 @@ bot.on("message", async (msg) => {
       errMsg += `\`${err.message}\``;
     }
 
-    bot.sendMessage(chatId, errMsg, { parse_mode: "Markdown" });
+    await safeSendMessage(chatId, errMsg);
   }
 });
 
