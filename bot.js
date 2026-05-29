@@ -629,6 +629,76 @@ async function handleHTMLExtraction(chatId, replyText) {
   }
 }
 
+// ─── Local Console Command Runner (Realtime Polling Bridge) ──────────────────
+async function runLocalCommand(chatId, commandText) {
+  if (!supabase) {
+    return bot.sendMessage(chatId, "❌ Supabase no está configurada.");
+  }
+  
+  const statusMsg = await bot.sendMessage(chatId, `⏳ *Enviando comando a tu PC local...*\n\`${commandText}\``, { parse_mode: "Markdown" });
+  
+  try {
+    const { data, error } = await supabase
+      .from("antigravity_local_queue")
+      .insert({ command: commandText, status: "pending" })
+      .select()
+      .single();
+      
+    if (error) throw error;
+    
+    const jobId = data.id;
+    let attempts = 0;
+    const maxAttempts = 20; // 20 * 1.5s = 30s timeout
+    
+    const interval = setInterval(async () => {
+      attempts++;
+      const { data: job, error: pollError } = await supabase
+        .from("antigravity_local_queue")
+        .select("status, result")
+        .eq("id", jobId)
+        .single();
+        
+      if (pollError) {
+        clearInterval(interval);
+        await bot.editMessageText(`❌ *Error al consultar estatus del comando:*\n\`${pollError.message}\``, {
+          chat_id: chatId,
+          message_id: statusMsg.message_id,
+          parse_mode: "Markdown"
+        });
+        return;
+      }
+      
+      if (job.status === "completed" || job.status === "failed") {
+        clearInterval(interval);
+        
+        const statusIndicator = job.status === "completed" ? "✅" : "❌";
+        const resultHeader = `${statusIndicator} *Consola (PC Local) — ID ${jobId}*\n\n`;
+        const formattedResult = `\`\`\`\n${job.result}\n\`\`\``;
+        
+        await bot.editMessageText(resultHeader + formattedResult, {
+          chat_id: chatId,
+          message_id: statusMsg.message_id,
+          parse_mode: "Markdown"
+        });
+      } else if (attempts >= maxAttempts) {
+        clearInterval(interval);
+        await bot.editMessageText(`⚠️ *Tiempo de espera agotado.*\nEl PC local no respondió al comando en 30 segundos. Verifica que \`node antigravity-bridge.js\` esté corriendo en tu PC.`, {
+          chat_id: chatId,
+          message_id: statusMsg.message_id,
+          parse_mode: "Markdown"
+        });
+      }
+    }, 1500);
+    
+  } catch (err) {
+    await bot.editMessageText(`❌ *Error al insertar comando:* \`${err.message}\``, {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      parse_mode: "Markdown"
+    });
+  }
+}
+
 // ─── Main message handler ─────────────────────────────────────────────────────
 bot.on("message", async (msg) => {
   const chatId   = msg.chat.id;
@@ -639,6 +709,24 @@ bot.on("message", async (msg) => {
   if (!isAllowed(userId)) {
     bot.sendMessage(chatId, "⛔ No estás autorizado para acceder a este bot.");
     console.log(chalk.yellow(`[AUTH] Usuario bloqueado: @${username} (${userId})`));
+    return;
+  }
+
+  // Interceptar comandos de consola local (🖥️)
+  if (msg.text && (msg.text.startsWith("🖥️") || msg.text.toLowerCase().startsWith("cmd:"))) {
+    let commandText = "";
+    if (msg.text.startsWith("🖥️")) {
+      commandText = msg.text.substring(2).trim();
+    } else {
+      commandText = msg.text.substring(4).trim();
+    }
+    
+    if (!commandText) {
+      bot.sendMessage(chatId, "❌ Por favor escribe un comando después de la 🖥️ (Ej: `🖥️ dir` o `🖥️ git status`).", { parse_mode: "Markdown" });
+      return;
+    }
+    
+    await runLocalCommand(chatId, commandText);
     return;
   }
 
