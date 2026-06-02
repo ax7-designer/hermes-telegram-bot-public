@@ -23,7 +23,7 @@ http.createServer((req, res) => {
 // ─── Config ───────────────────────────────────────────────────────────────────
 const TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const OR_KEY  = process.env.OPENROUTER_API_KEY;
-const MODEL   = process.env.HERMES_MODEL || "qwen/qwen3.7-max";
+const MODEL   = process.env.HERMES_MODEL || "qwen/qwen3-max";
 const ALLOWED = process.env.ALLOWED_USER_ID ? Number(process.env.ALLOWED_USER_ID) : null;
 const MAX_HISTORY = 60;
 
@@ -142,11 +142,11 @@ async function transcribeAudio(audioBuffer) {
 
 // ─── Plan A: Model Configurations & Hardcoded Pricing (per 1M tokens) ──────────
 const MODELS_CONFIG = {
-  "qwen/qwen3.7-max": {
-    name: "Qwen 3.7 Max (Estrategia y Razonamiento)",
-    short: "Qwen 3.7 Max",
-    inputPrice: 0.40,
-    outputPrice: 1.20
+  "qwen/qwen3-max": {
+    name: "Qwen 3 Max (Estrategia y Razonamiento)",
+    short: "Qwen 3 Max",
+    inputPrice: 0.78,
+    outputPrice: 3.90
   },
   "anthropic/claude-sonnet-4.6": {
     name: "Claude Code / Sonnet 4.6 (Desarrollo y Código)",
@@ -160,11 +160,11 @@ const MODELS_CONFIG = {
     inputPrice: 0.00,
     outputPrice: 0.00
   },
-  "qwen/qwen3.6-flash": {
-    name: "Qwen 3.6 Flash (Velocidad y Ahorro Máximo)",
-    short: "Qwen 3.6 Flash",
-    inputPrice: 0.05,
-    outputPrice: 0.05
+  "qwen/qwen3-coder-next": {
+    name: "Qwen 3 Coder Next (Código y Automatización)",
+    short: "Qwen 3 Coder",
+    inputPrice: 0.11,
+    outputPrice: 0.80
   }
 };
 
@@ -318,7 +318,7 @@ async function askAI(chatId, userMessage) {
   }
 
   // 2. OpenRouter Execution Path (Qwen/Claude, o Fallback Activo de Gemini)
-  const finalModelId = (modelId === "google/gemini-2.5-flash") ? "qwen/qwen3.6-flash" : modelId;
+  const finalModelId = (modelId === "google/gemini-2.5-flash") ? "qwen/qwen3-coder-next" : modelId;
   const finalConfig = MODELS_CONFIG[finalModelId] || config;
 
   console.log(chalk.blue(`🤖 Ejecutando enrutamiento OpenRouter con modelo: ${finalModelId}...`));
@@ -391,7 +391,7 @@ async function showModelPanel(chatId) {
 
   const inlineKeyboard = [
     [
-      { text: `🧠 Qwen 3.7 Max ($0.40/$1.20) ${currentModelId === 'qwen/qwen3.7-max' ? '✅' : ''}`, callback_data: 'set_model:qwen' }
+      { text: `🧠 Qwen 3 Max ($0.78/$3.90) ${currentModelId === 'qwen/qwen3-max' ? '✅' : ''}`, callback_data: 'set_model:qwen' }
     ],
     [
       { text: `💻 Claude Code ($3.00/$15.00) ${currentModelId === 'anthropic/claude-sonnet-4.6' ? '✅' : ''}`, callback_data: 'set_model:claude' }
@@ -400,7 +400,7 @@ async function showModelPanel(chatId) {
       { text: `🌐 Gemini 2.5 Flash (Directo - GRATIS) ${currentModelId === 'google/gemini-2.5-flash' ? '✅' : ''}`, callback_data: 'set_model:gemini' }
     ],
     [
-      { text: `⚡ Qwen 3.6 Flash ($0.05/$0.05) ${currentModelId === 'qwen/qwen3.6-flash' ? '✅' : ''}`, callback_data: 'set_model:flash' }
+      { text: `⚡ Qwen 3 Coder ($0.11/$0.80) ${currentModelId === 'qwen/qwen3-coder-next' ? '✅' : ''}`, callback_data: 'set_model:flash' }
     ]
   ];
 
@@ -519,8 +519,8 @@ bot.on("callback_query", async (callbackQuery) => {
     let targetName = "";
 
     if (key === "qwen") {
-      targetModelId = "qwen/qwen3.7-max";
-      targetName = "Qwen 3.7 Max";
+      targetModelId = "qwen/qwen3-max";
+      targetName = "Qwen 3 Max";
     } else if (key === "claude") {
       targetModelId = "anthropic/claude-sonnet-4.6";
       targetName = "Claude Sonnet 4.6";
@@ -528,8 +528,8 @@ bot.on("callback_query", async (callbackQuery) => {
       targetModelId = "google/gemini-2.5-flash";
       targetName = "Gemini 2.5 Flash";
     } else if (key === "flash") {
-      targetModelId = "qwen/qwen3.6-flash";
-      targetName = "Qwen 3.6 Flash";
+      targetModelId = "qwen/qwen3-coder-next";
+      targetName = "Qwen 3 Coder";
     }
 
     if (targetModelId) {
@@ -548,7 +548,7 @@ bot.on("callback_query", async (callbackQuery) => {
 
       const updatedInlineKeyboard = [
         [
-          { text: `🧠 Qwen 3.7 Max ($0.40/$1.20) ${targetModelId === 'qwen/qwen3.7-max' ? '✅' : ''}`, callback_data: 'set_model:qwen' }
+          { text: `🧠 Qwen 3 Max ($0.78/$3.90) ${targetModelId === 'qwen/qwen3-max' ? '✅' : ''}`, callback_data: 'set_model:qwen' }
         ],
         [
           { text: `💻 Claude Code ($3.00/$15.00) ${targetModelId === 'anthropic/claude-sonnet-4.6' ? '✅' : ''}`, callback_data: 'set_model:claude' }
@@ -557,7 +557,7 @@ bot.on("callback_query", async (callbackQuery) => {
           { text: `🌐 Gemini 2.5 Flash (Directo - GRATIS) ${targetModelId === 'google/gemini-2.5-flash' ? '✅' : ''}`, callback_data: 'set_model:gemini' }
         ],
         [
-          { text: `⚡ Qwen 3.6 Flash ($0.05/$0.05) ${targetModelId === 'qwen/qwen3.6-flash' ? '✅' : ''}`, callback_data: 'set_model:flash' }
+          { text: `⚡ Qwen 3 Coder ($0.11/$0.80) ${targetModelId === 'qwen/qwen3-coder-next' ? '✅' : ''}`, callback_data: 'set_model:flash' }
         ]
       ];
 
