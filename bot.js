@@ -11,7 +11,12 @@ const {
   getNextAction,
   formatTodayAscii,
   formatCloseAscii,
-  formatCaptureAscii
+  formatCaptureAscii,
+  formatProjectsAscii,
+  formatProfilesAscii,
+  setProfile,
+  getProfile,
+  detectSecretaryIntent
 } = require("./secretary");
 
 // ─── Render Health Check Web Server ──────────────────────────────────────────
@@ -490,6 +495,68 @@ async function showNextAction(chatId) {
   return bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
 }
 
+async function showActiveProfile(chatId) {
+  const profile = getProfile(secretaryState, chatId);
+  return bot.sendMessage(
+    chatId,
+    [
+      "```",
+      "HERMES / PERFIL",
+      "==============================",
+      `Activo: ${profile.label}`,
+      "",
+      profile.purpose,
+      "```"
+    ].join("\n"),
+    { parse_mode: "Markdown" }
+  );
+}
+
+async function changeProfile(chatId, input) {
+  const profile = setProfile(secretaryState, chatId, input);
+  return bot.sendMessage(
+    chatId,
+    [
+      "```",
+      "HERMES / PERFIL",
+      "==============================",
+      `Activo: ${profile.label}`,
+      "",
+      profile.purpose,
+      "```"
+    ].join("\n"),
+    { parse_mode: "Markdown" }
+  );
+}
+
+async function handleSecretaryIntent(chatId, text) {
+  const intent = detectSecretaryIntent(text);
+  if (!intent) return false;
+
+  if (intent.type === "PROJECTS") {
+    await bot.sendMessage(chatId, formatProjectsAscii(secretaryState, chatId), { parse_mode: "Markdown" });
+    return true;
+  }
+  if (intent.type === "NEXT") {
+    await showNextAction(chatId);
+    return true;
+  }
+  if (intent.type === "PROFILES") {
+    await bot.sendMessage(chatId, formatProfilesAscii(secretaryState, chatId), { parse_mode: "Markdown" });
+    return true;
+  }
+  if (intent.type === "SET_PROFILE") {
+    await changeProfile(chatId, intent.profileId);
+    return true;
+  }
+  if (intent.type === "CAPTURE") {
+    await handleSecretaryCapture(chatId, intent.text);
+    return true;
+  }
+
+  return false;
+}
+
 async function runStatusCheck(chatId) {
   let currentModelId = activeModels.get(chatId) || MODEL;
   if (currentModelId === "google/gemini-3.1-pro-preview") {
@@ -551,6 +618,10 @@ bot.onText(/\/start/, (msg) => {
           [
             { text: "HERMES / HOY" },
             { text: "HERMES / SIGUIENTE" }
+          ],
+          [
+            { text: "HERMES / PROYECTOS" },
+            { text: "HERMES / PERFILES" }
           ]
         ],
         resize_keyboard: true,
@@ -588,20 +659,38 @@ bot.onText(/\/model/, async (msg) => {
   await showModelPanel(msg.chat.id);
 });
 
-bot.onText(/\/captura(?:\s+([\s\S]+))?/, async (msg, match) => {
+bot.onText(/^\/captura(?:\s+([\s\S]+))?$/, async (msg, match) => {
   await handleSecretaryCapture(msg.chat.id, match && match[1]);
 });
 
-bot.onText(/\/hoy/, async (msg) => {
+bot.onText(/^\/hoy$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, formatTodayAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
 });
 
-bot.onText(/\/siguiente/, async (msg) => {
+bot.onText(/^\/siguiente$/, async (msg) => {
   await showNextAction(msg.chat.id);
 });
 
-bot.onText(/\/cierre/, async (msg) => {
+bot.onText(/^\/cierre$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, formatCloseAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
+});
+
+bot.onText(/^\/proyectos$/, async (msg) => {
+  await bot.sendMessage(msg.chat.id, formatProjectsAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
+});
+
+bot.onText(/^\/perfiles$/, async (msg) => {
+  await bot.sendMessage(msg.chat.id, formatProfilesAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
+});
+
+bot.onText(/^\/perfil(?:\s+(.+))?$/, async (msg, match) => {
+  const input = match && match[1] ? match[1].trim() : "";
+  if (!input) {
+    await showActiveProfile(msg.chat.id);
+    return;
+  }
+
+  await changeProfile(msg.chat.id, input);
 });
 
 // Callback queries handler for inline buttons
@@ -838,6 +927,14 @@ bot.on("message", async (msg) => {
       await showNextAction(chatId);
       return;
     }
+    if (msg.text === "HERMES / PROYECTOS") {
+      await bot.sendMessage(chatId, formatProjectsAscii(secretaryState, chatId), { parse_mode: "Markdown" });
+      return;
+    }
+    if (msg.text === "HERMES / PERFILES") {
+      await bot.sendMessage(chatId, formatProfilesAscii(secretaryState, chatId), { parse_mode: "Markdown" });
+      return;
+    }
     if (msg.text === "🤖 Seleccionar Modelo") {
       await showModelPanel(chatId);
       return;
@@ -900,6 +997,10 @@ bot.on("message", async (msg) => {
   }
 
   console.log(chalk.cyan(`[MSG] @${username} → ${textToProcess.substring(0, 60)}${textToProcess.length > 60 ? "..." : ""}`));
+
+  if (await handleSecretaryIntent(chatId, textToProcess)) {
+    return;
+  }
 
   // Show typing indicator
   bot.sendChatAction(chatId, "typing");

@@ -7,7 +7,12 @@ const {
   addCapture,
   getNextAction,
   formatTodayAscii,
-  formatCloseAscii
+  formatCloseAscii,
+  formatProjectsAscii,
+  updateProject,
+  setProfile,
+  getProfile,
+  detectSecretaryIntent
 } = require("./secretary");
 
 test("classifyText detects tasks, ideas, blockers and reminders", () => {
@@ -60,4 +65,60 @@ test("formatCloseAscii includes one next action", () => {
   assert.match(output, /HERMES \/ CIERRE/);
   assert.match(output, /SIGUIENTE ACCION/);
   assert.match(output, /preparar cierre diario/);
+});
+
+test("formatProjectsAscii orders projects by last modification and limits progress to top three", () => {
+  const state = createSecretaryState();
+  updateProject(state, 1, "Hijo de Hermes", {
+    status: "activo",
+    progress: ["Bot Telegram creado"],
+    pending: ["Revisar polling"],
+    ssPlus: ["Abrir Render"],
+    updatedAt: "2026-06-09T12:00:00.000Z"
+  });
+  updateProject(state, 1, "MAE Wellness Club", {
+    status: "pendiente",
+    progress: ["Health-check existe"],
+    pending: ["Conectar alertas"],
+    ssPlus: ["Abrir carpeta monitor"],
+    updatedAt: "2026-06-09T11:00:00.000Z"
+  });
+  updateProject(state, 1, "EcoVanguard", {
+    status: "activo",
+    progress: ["Wise Pipeline documentado"],
+    pending: ["Definir tablero visual"],
+    updatedAt: "2026-06-09T10:00:00.000Z"
+  });
+  updateProject(state, 1, "Sheldon Bot Finanzas", {
+    status: "idea",
+    progress: ["Persona definida en backlog"],
+    pending: ["Crear prompt"],
+    updatedAt: "2026-06-09T09:00:00.000Z"
+  });
+
+  const output = formatProjectsAscii(state, 1);
+
+  assert.match(output, /1\. HIJO DE HERMES/);
+  assert.match(output, /2\. MAE WELLNESS CLUB/);
+  assert.match(output, /SS\+:/);
+  assert.equal((output.match(/Progreso:/g) || []).length, 3);
+  assert.doesNotMatch(output, /SHELDON BOT FINANZAS[\s\S]*Progreso:/);
+});
+
+test("profile helpers keep a voice-first default and support switching roles", () => {
+  const state = createSecretaryState();
+
+  assert.equal(getProfile(state, 1).id, "secretario");
+  assert.equal(setProfile(state, 1, "tecnico").id, "tecnico");
+  assert.equal(getProfile(state, 1).label, "TECNICO");
+});
+
+test("detectSecretaryIntent maps natural voice phrases to secretary actions", () => {
+  assert.deepEqual(detectSecretaryIntent("Hermes, proyectos"), { type: "PROJECTS" });
+  assert.deepEqual(detectSecretaryIntent("Hermes, siguiente microaccion"), { type: "NEXT" });
+  assert.deepEqual(detectSecretaryIntent("Hermes, perfil tecnico"), { type: "SET_PROFILE", profileId: "tecnico" });
+
+  const capture = detectSecretaryIntent("Hermes, captura tarea: revisar Render");
+  assert.equal(capture.type, "CAPTURE");
+  assert.equal(capture.text, "tarea: revisar Render");
 });
