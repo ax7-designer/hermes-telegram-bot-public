@@ -12,7 +12,8 @@ const {
   updateProject,
   setProfile,
   getProfile,
-  detectSecretaryIntent
+  detectSecretaryIntent,
+  formatVoiceStatusAscii
 } = require("./secretary");
 
 test("classifyText detects tasks, ideas, blockers and reminders", () => {
@@ -117,8 +118,18 @@ test("detectSecretaryIntent maps natural voice phrases to secretary actions", ()
   assert.deepEqual(detectSecretaryIntent("Hermes, proyectos"), { type: "PROJECTS" });
   assert.deepEqual(detectSecretaryIntent("Hermes, siguiente microaccion"), { type: "NEXT" });
   assert.deepEqual(detectSecretaryIntent("Hermes, perfil tecnico"), { type: "SET_PROFILE", profileId: "tecnico" });
+  assert.deepEqual(detectSecretaryIntent("Hermes, voz"), { type: "VOICE_STATUS" });
 
   const capture = detectSecretaryIntent("Hermes, captura tarea: revisar Render");
   assert.equal(capture.type, "CAPTURE");
   assert.equal(capture.text, "tarea: revisar Render");
+});
+
+test("formatVoiceStatusAscii explains current no-extra-cost voice path", () => {
+  const output = formatVoiceStatusAscii();
+
+  assert.match(output, /HERMES \/ VOZ/);
+  assert.match(output, /Entrada/);
+  assert.match(output, /Gemini/);
+  assert.match(output, /TTS/);
 });

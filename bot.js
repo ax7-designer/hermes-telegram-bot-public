@@ -14,6 +14,7 @@ const {
   formatCaptureAscii,
   formatProjectsAscii,
   formatProfilesAscii,
+  formatVoiceStatusAscii,
   setProfile,
   getProfile,
   detectSecretaryIntent
@@ -545,6 +546,10 @@ async function handleSecretaryIntent(chatId, text) {
     await bot.sendMessage(chatId, formatProfilesAscii(secretaryState, chatId), { parse_mode: "Markdown" });
     return true;
   }
+  if (intent.type === "VOICE_STATUS") {
+    await bot.sendMessage(chatId, formatVoiceStatusAscii(), { parse_mode: "Markdown" });
+    return true;
+  }
   if (intent.type === "SET_PROFILE") {
     await changeProfile(chatId, intent.profileId);
     return true;
@@ -691,6 +696,10 @@ bot.onText(/^\/perfil(?:\s+(.+))?$/, async (msg, match) => {
   }
 
   await changeProfile(msg.chat.id, input);
+});
+
+bot.onText(/^\/voz$/, async (msg) => {
+  await bot.sendMessage(msg.chat.id, formatVoiceStatusAscii(), { parse_mode: "Markdown" });
 });
 
 // Callback queries handler for inline buttons

@@ -463,6 +463,33 @@ function formatProfilesAscii(state, chatId) {
   return lines.join("\n");
 }
 
+function formatVoiceStatusAscii() {
+  return [
+    "```",
+    "HERMES / VOZ",
+    "==============================",
+    "Entrada:",
+    "- Telegram voice note",
+    "- Gemini 2.5 Flash STT",
+    "- Intents naturales antes de gastar tokens",
+    "",
+    "Salida:",
+    "- Texto ASCII por ahora",
+    "- TTS opcional en fase 2",
+    "",
+    "Ruta recomendada:",
+    "1. Habla: Hermes, proyectos",
+    "2. Hermes transcribe",
+    "3. Hermes ejecuta intent local",
+    "4. Responde sin OpenRouter si no hace falta",
+    "",
+    "TTS:",
+    "- No activado aun",
+    "- Activarlo solo con presupuesto/control de billing",
+    "```"
+  ].join("\n");
+}
+
 function detectSecretaryIntent(input) {
   const raw = String(input || "").trim();
   const normalized = normalizeText(raw).replace(/^hermes[\s,:-]*/, "").trim();
@@ -476,6 +503,9 @@ function detectSecretaryIntent(input) {
   }
   if (/^(perfiles|roles|modos)\b/.test(normalized)) {
     return { type: "PROFILES" };
+  }
+  if (/^(voz|estado de voz|modo voz|audio)\b/.test(normalized)) {
+    return { type: "VOICE_STATUS" };
   }
   if (/^(perfil|modo)\b/.test(normalized)) {
     return { type: "SET_PROFILE", profileId: resolveProfileId(normalized) || "secretario" };
@@ -499,6 +529,7 @@ module.exports = {
   formatCaptureAscii,
   formatProjectsAscii,
   formatProfilesAscii,
+  formatVoiceStatusAscii,
   updateProject,
   setProfile,
   getProfile,
