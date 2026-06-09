@@ -20,34 +20,64 @@ const {
   detectSecretaryIntent
 } = require("./secretary");
 
-// ─── Render Health Check Web Server ──────────────────────────────────────────
-const HTTP_PORT = process.env.PORT || 10000;
-http.createServer((req, res) => {
-  if (req.url === "/health" || req.url === "/") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("OK");
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
-}).listen(HTTP_PORT, () => {
-  console.log(chalk.yellow(`[HTTP] Servidor de salud activo en puerto ${HTTP_PORT}`));
-});
-
-// ─── Config ───────────────────────────────────────────────────────────────────
 const TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const OR_KEY  = process.env.OPENROUTER_API_KEY;
 const MODEL   = process.env.HERMES_MODEL || "qwen/qwen3-max";
 const ALLOWED = process.env.ALLOWED_USER_ID ? Number(process.env.ALLOWED_USER_ID) : null;
 const MAX_HISTORY = 60;
+const HTTP_PORT = process.env.PORT || 10000;
+const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || (TOKEN ? TOKEN.split(":")[1].slice(0, 24) : "bot");
+const WEBHOOK_PATH = `/telegram/${WEBHOOK_SECRET}`;
+const WEBHOOK_BASE_URL = process.env.TELEGRAM_WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL || "";
+const USE_TELEGRAM_WEBHOOK = Boolean(WEBHOOK_BASE_URL);
+const WEBHOOK_URL = `${WEBHOOK_BASE_URL.replace(/\/$/, "")}${WEBHOOK_PATH}`;
 
 if (!TOKEN || !OR_KEY) {
-  console.error(chalk.red("❌  Falta TELEGRAM_BOT_TOKEN o OPENROUTER_API_KEY en el archivo .env"));
+  console.error(chalk.red("Falta TELEGRAM_BOT_TOKEN o OPENROUTER_API_KEY en el archivo .env"));
   process.exit(1);
 }
 
-// ─── Clients ──────────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TOKEN, { polling: true });
+const bot = new TelegramBot(TOKEN, { polling: !USE_TELEGRAM_WEBHOOK });
+
+// ─── Render Health Check Web Server ──────────────────────────────────────────
+http.createServer((req, res) => {
+  if (req.url === "/health" || req.url === "/") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      mode: USE_TELEGRAM_WEBHOOK ? "webhook" : "polling",
+      webhookConfigured: USE_TELEGRAM_WEBHOOK
+    }));
+  } else if (USE_TELEGRAM_WEBHOOK && req.method === "POST" && req.url === WEBHOOK_PATH) {
+    if (req.headers["x-telegram-bot-api-secret-token"] !== WEBHOOK_SECRET) {
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      res.end("FORBIDDEN");
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      try {
+        bot.processUpdate(JSON.parse(body));
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("OK");
+      } catch (err) {
+        console.error(chalk.red(`[WEBHOOK ERR] ${err.message}`));
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("BAD REQUEST");
+      }
+    });
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+}).listen(HTTP_PORT, () => {
+  console.log(chalk.yellow(`[HTTP] Servidor activo en puerto ${HTTP_PORT} (${USE_TELEGRAM_WEBHOOK ? "webhook" : "polling"})`));
+});
+
 
 // OpenRouter Client (for Claude and Qwen)
 const openai = new OpenAI({
@@ -1051,9 +1081,29 @@ bot.on("polling_error", (err) => {
   console.error(chalk.red(`[ERROR DE POLLING] ${err.message}`));
 });
 
+async function configureTelegramDelivery() {
+  if (!USE_TELEGRAM_WEBHOOK) {
+    console.log(chalk.gray("[TELEGRAM] Modo polling local activo."));
+    return;
+  }
+
+  try {
+    await bot.setWebHook(WEBHOOK_URL, {
+      secret_token: WEBHOOK_SECRET,
+      allowed_updates: ["message", "callback_query"],
+      drop_pending_updates: false
+    });
+    console.log(chalk.green("[TELEGRAM] Webhook activo en Render."));
+  } catch (err) {
+    console.error(chalk.red(`[TELEGRAM WEBHOOK ERR] ${err.message}`));
+  }
+}
+
 // ─── Startup ──────────────────────────────────────────────────────────────────
 console.log(chalk.bold.cyan("\n  🧠 QWEN/GEMINI TELEGRAM BOT (ax7.createga)"));
 console.log(chalk.gray("  ─────────────────────────────────────────────"));
 console.log(chalk.white(`  Modelo  : ${MODEL}`));
 console.log(chalk.white(`  Acceso  : ${ALLOWED ? `ID de Usuario ${ALLOWED} únicamente` : "Abierto a todos"}`));
 console.log(chalk.green("  Estado  : En línea y escuchando peticiones...\n"));
+console.log(chalk.white(`  Entrega : ${USE_TELEGRAM_WEBHOOK ? "Webhook Render" : "Polling local"}`));
+configureTelegramDelivery();
