@@ -5,6 +5,14 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { createClient } = require("@supabase/supabase-js");
 const chalk = require("chalk");
 const http = require("http");
+const {
+  createSecretaryState,
+  addCapture,
+  getNextAction,
+  formatTodayAscii,
+  formatCloseAscii,
+  formatCaptureAscii
+} = require("./secretary");
 
 // ─── Render Health Check Web Server ──────────────────────────────────────────
 const HTTP_PORT = process.env.PORT || 10000;
@@ -170,6 +178,7 @@ const MODELS_CONFIG = {
 
 // State for active model per chat
 const activeModels = new Map();
+const secretaryState = createSecretaryState();
 
 function getModelConfig(chatId) {
   const modelId = activeModels.get(chatId) || MODEL;
@@ -424,6 +433,56 @@ function showHelp(chatId) {
   );
 }
 
+async function handleSecretaryCapture(chatId, input) {
+  const cleanInput = String(input || "").trim();
+  if (!cleanInput) {
+    return bot.sendMessage(
+      chatId,
+      [
+        "```",
+        "HERMES / CAPTURA",
+        "==============================",
+        "Escribe algo despues de /captura.",
+        "",
+        "Ejemplo:",
+        "/captura tarea: revisar RLS de Supabase",
+        "```"
+      ].join("\n"),
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  const item = addCapture(secretaryState, chatId, cleanInput);
+  return bot.sendMessage(chatId, formatCaptureAscii(item), { parse_mode: "Markdown" });
+}
+
+async function showNextAction(chatId) {
+  const next = getNextAction(secretaryState, chatId);
+  const text = next
+    ? [
+        "```",
+        "HERMES / SIGUIENTE",
+        "==============================",
+        `[${next.id}] ${next.type}`,
+        "",
+        next.text,
+        "",
+        "Haz solo esto primero.",
+        "```"
+      ].join("\n")
+    : [
+        "```",
+        "HERMES / SIGUIENTE",
+        "==============================",
+        "No hay capturas abiertas.",
+        "",
+        "Usa /captura para guardar una idea o tarea.",
+        "```"
+      ].join("\n");
+
+  return bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
+}
+
 async function runStatusCheck(chatId) {
   let currentModelId = activeModels.get(chatId) || MODEL;
   if (currentModelId === "google/gemini-3.1-pro-preview") {
@@ -481,6 +540,10 @@ bot.onText(/\/start/, (msg) => {
           [
             { text: "🔄 Limpiar Historial" },
             { text: "🔧 Menú de Ayuda" }
+          ],
+          [
+            { text: "HERMES / HOY" },
+            { text: "HERMES / SIGUIENTE" }
           ]
         ],
         resize_keyboard: true,
@@ -516,6 +579,22 @@ bot.onText(/\/reset/, async (msg) => {
 
 bot.onText(/\/model/, async (msg) => {
   await showModelPanel(msg.chat.id);
+});
+
+bot.onText(/\/captura(?:\s+([\s\S]+))?/, async (msg, match) => {
+  await handleSecretaryCapture(msg.chat.id, match && match[1]);
+});
+
+bot.onText(/\/hoy/, async (msg) => {
+  await bot.sendMessage(msg.chat.id, formatTodayAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
+});
+
+bot.onText(/\/siguiente/, async (msg) => {
+  await showNextAction(msg.chat.id);
+});
+
+bot.onText(/\/cierre/, async (msg) => {
+  await bot.sendMessage(msg.chat.id, formatCloseAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
 });
 
 // Callback queries handler for inline buttons
@@ -744,6 +823,14 @@ bot.on("message", async (msg) => {
   // Interceptar botones persistentes de menú táctil
   if (msg.text) {
     if (msg.text.startsWith("/")) return;
+    if (msg.text === "HERMES / HOY") {
+      await bot.sendMessage(chatId, formatTodayAscii(secretaryState, chatId), { parse_mode: "Markdown" });
+      return;
+    }
+    if (msg.text === "HERMES / SIGUIENTE") {
+      await showNextAction(chatId);
+      return;
+    }
     if (msg.text === "🤖 Seleccionar Modelo") {
       await showModelPanel(chatId);
       return;

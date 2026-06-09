@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node bot.js",
     "dev": "node --watch bot.js",
-    "send:hermes": "node send_hermes_message.js"
+    "send:hermes": "node send_hermes_message.js",
+    "test": "node --test secretary.test.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
