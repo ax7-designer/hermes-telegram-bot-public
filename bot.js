@@ -253,8 +253,12 @@ function isAllowed(userId) {
 
 // ─── OpenRouter Credits Tracker ───────────────────────────────────────────────
 async function fetchBalance() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+
   try {
     const res = await fetch("https://openrouter.ai/api/v1/credits", {
+      signal: controller.signal,
       headers: {
         "Authorization": `Bearer ${OR_KEY}`
       }
@@ -265,8 +269,11 @@ async function fetchBalance() {
       return `$${remaining.toFixed(4)}`;
     }
   } catch (err) {
-    console.error("Error obteniendo créditos de OpenRouter:", err.message);
+    console.error("Error obteniendo creditos de OpenRouter:", err.message);
+  } finally {
+    clearTimeout(timeout);
   }
+
   return "N/A";
 }
 
