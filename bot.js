@@ -494,6 +494,17 @@ bot.onText(/\/help/, (msg) => {
   showHelp(msg.chat.id);
 });
 
+bot.onText(/\/id/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    [
+      "Hermes ID check",
+      `chat_id: ${msg.chat.id}`,
+      `user_id: ${msg.from.id}`
+    ].join("\n")
+  );
+});
+
 bot.onText(/\/reset/, async (msg) => {
   await saveHistory(msg.chat.id, []);
   bot.sendMessage(
