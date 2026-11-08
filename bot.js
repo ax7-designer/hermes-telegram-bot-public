@@ -48,6 +48,33 @@ const HERMES_PROXY_IP_ALLOWLIST = process.env.HERMES_PROXY_ALLOWED_IPS
   : null;
 const MAX_HISTORY = 60;
 const HTTP_PORT = process.env.PORT || 10000;
+
+// Obsidian vault access (optional — only when OBSIDIAN_VAULT_PATH is set)
+const OBSIDIAN_VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH || null;
+const fs = require("fs");
+const path = require("path");
+
+function readObsidianFile(relativePath) {
+  if (!OBSIDIAN_VAULT_PATH) {
+    throw new Error("OBSIDIAN_VAULT_PATH not configured");
+  }
+  const fullPath = path.join(OBSIDIAN_VAULT_PATH, relativePath);
+  if (!fs.existsSync(fullPath)) {
+    throw new Error(`File not found: ${relativePath}`);
+  }
+  return fs.readFileSync(fullPath, "utf-8");
+}
+
+function listObsidianFiles(relativePath = "") {
+  if (!OBSIDIAN_VAULT_PATH) {
+    return [];
+  }
+  const fullPath = path.join(OBSIDIAN_VAULT_PATH, relativePath);
+  if (!fs.existsSync(fullPath)) {
+    return [];
+  }
+  return fs.readdirSync(fullPath).filter((f) => f.endsWith(".md"));
+}
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || (TOKEN ? TOKEN.split(":")[1].slice(0, 24) : "bot");
 const WEBHOOK_PATH = `/telegram/${WEBHOOK_SECRET}`;
 const WEBHOOK_BASE_URL = process.env.TELEGRAM_WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL || "";
