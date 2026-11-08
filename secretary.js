@@ -10,6 +10,7 @@ const TYPE_LABELS = {
 };
 
 const TYPE_ORDER = ["BLOCKER", "TASK", "REMINDER", "DECISION", "QUESTION", "PROJECT", "IDEA", "NOTE"];
+const PIN_COLORS = ["CYAN", "VERDE", "AMBAR", "MAGENTA", "GRIS"];
 
 const PROFILES = {
   secretario: {
@@ -41,6 +42,11 @@ const PROFILES = {
     id: "operador",
     label: "OPERADOR",
     purpose: "Coordina acciones sobre la PC local con confirmacion."
+  },
+  director: {
+    id: "director",
+    label: "DIRECTOR HIBRIDO",
+    purpose: "Desglosa ideas de video/voz en guiones de produccion (A-Roll / B-Roll IA / CTA)."
   }
 };
 
@@ -62,10 +68,43 @@ const PROFILE_ALIASES = {
   seguridad: "auditor",
   operador: "operador",
   pc: "operador",
-  computadora: "operador"
+  computadora: "operador",
+  director: "director",
+  directora: "director",
+  video: "director",
+  guion: "director",
+  produccion: "director",
+  contenido: "director"
 };
 
+// ponytail: static workspace map; upgrade to filesystem discovery if these roots change often.
 const DEFAULT_PROJECTS = [
+  {
+    name: "Codex + Antigravity Workspace",
+    status: "activo, carpetas integradas sin chats",
+    folder: "D:/AI",
+    agents: ["Codex", "Antigravity"],
+    sync: [
+      "Codex workspace: D:/AI",
+      "Antigravity bot: D:/AI/Hermes/telegram-bot",
+      "Seguimiento visual: D:/AI/Hermes/seguimiento"
+    ],
+    chatScope: "fuera del tablero",
+    progress: [
+      "Codex trabaja en D:/AI",
+      "Antigravity bridge vive en Hermes/telegram-bot",
+      "Chats excluidos del orden visual"
+    ],
+    pending: [
+      "Validar si despues se moveran carpetas reales",
+      "Elegir nombres finales de columnas visuales"
+    ],
+    ssPlus: [
+      "Abrir D:/AI",
+      "Abrir Hermes/telegram-bot",
+      "Pedir Hermes, proyectos"
+    ]
+  },
   {
     name: "Hijo de Hermes",
     status: "activo, revisar estabilidad cloud",
@@ -86,36 +125,39 @@ const DEFAULT_PROJECTS = [
   },
   {
     name: "Antigravity Local Bridge",
-    status: "construido, pendiente prueba E2E",
+    status: "construido, detenido hasta endurecer comandos",
     progress: [
       "antigravity-bridge.js existe",
-      "START_ANTIGRAVITY_BRIDGE.bat existe"
+      "START_ANTIGRAVITY_BRIDGE.bat existe",
+      "No activar mientras ejecute texto arbitrario"
     ],
     pending: [
-      "Probar comando desde Telegram",
-      "Confirmar regreso de resultado"
+      "Definir allowlist de comandos de solo lectura",
+      "Añadir aprobación antes de ejecutar un comando"
     ],
     ssPlus: [
-      "Encender el .bat",
-      "Enviar cmd: dir",
-      "Leer una linea del resultado"
+      "Mantener el puente detenido",
+      "Revisar límites de comando y salida",
+      "Preparar una prueba inocua después de endurecerlo"
     ]
   },
   {
     name: "Supabase / Seguridad RLS",
-    status: "pendiente critico",
+    status: "esquema nuevo reportado, corte pendiente",
     progress: [
-      "SQL de remediacion preparado",
-      "Riesgo anon key identificado"
+      "telegram_chat_history y hermes_proxy_usage creadas por el propietario",
+      "Las dos colas aparecen en Realtime",
+      "Consulta local lista para revisar RLS y grants"
     ],
     pending: [
-      "Cambiar SUPABASE_KEY a service_role/secret",
-      "Aplicar RLS sin romper Hermes"
+      "Verificar RLS, policies y grants en las cuatro tablas",
+      "Configurar ALLOWED_USER_ID antes de usar el bot",
+      "Probar persistencia con clave de servidor sin interrumpir Render"
     ],
     ssPlus: [
-      "Abrir Supabase SQL Editor",
-      "Copiar 1 bloque SQL",
-      "Verificar rowsecurity true"
+      "Correr fresh-project-check.sql en el proyecto nuevo",
+      "Confirmar policies y grants publicos vacios",
+      "Mantener el proyecto anterior disponible para rollback"
     ]
   },
   {
@@ -140,11 +182,12 @@ const DEFAULT_PROJECTS = [
     status: "marco estrategico activo",
     progress: [
       "Wise Pipeline documentado",
-      "Formato ASCII adoptado"
+      "Formato ASCII adoptado",
+      "Tablero visual inicial Codex + Antigravity agregado"
     ],
     pending: [
-      "Convertir proyectos en tablero visual",
-      "Definir fichas tipo Trello"
+      "Refinar columnas visuales del tablero",
+      "Definir fichas tipo Trello si todavia aportan"
     ],
     ssPlus: [
       "Elegir 1 color por proyecto",
@@ -385,6 +428,14 @@ function formatBullets(items, fallback) {
   return items.map((item) => `- ${item}`).join("\n");
 }
 
+function formatInlineList(items) {
+  return Array.isArray(items) ? items.join(" + ") : String(items || "");
+}
+
+function formatPinPrefix(index) {
+  return index < PIN_COLORS.length ? `[PIN-${index + 1} ${PIN_COLORS[index]}] ` : "";
+}
+
 function suggestSSPlus(project) {
   if (project.ssPlus && project.ssPlus.length) return project.ssPlus;
   const pending = (project.pending && project.pending[0]) || "dar el primer paso";
@@ -408,9 +459,16 @@ function formatProjectsAscii(state, chatId) {
   ];
 
   projects.forEach((project, index) => {
-    lines.push(`${index + 1}. ${project.name.toUpperCase()}`);
+    lines.push(`${index + 1}. ${formatPinPrefix(index)}${project.name.toUpperCase()}`);
     lines.push(`Estado: ${project.status || "sin estado"}`);
     lines.push(`Modificado: ${formatDate(project.updatedAt)}`);
+    if (project.folder) lines.push(`Carpeta: ${project.folder}`);
+    if (project.agents) lines.push(`Agentes: ${formatInlineList(project.agents)}`);
+    if (project.sync && project.sync.length) {
+      lines.push("Sincronia:");
+      lines.push(formatBullets(project.sync, "Sin rutas sincronizadas"));
+    }
+    if (project.chatScope) lines.push(`Chats: ${project.chatScope}`);
 
     if (index < 3) {
       lines.push("Progreso:");
@@ -506,6 +564,9 @@ function detectSecretaryIntent(input) {
   }
   if (/^(voz|estado de voz|modo voz|audio)\b/.test(normalized)) {
     return { type: "VOICE_STATUS" };
+  }
+  if (/^(director|modo director|perfil director|modo video|crear video|grabar video)\b/.test(normalized)) {
+    return { type: "SET_PROFILE", profileId: "director" };
   }
   if (/^(perfil|modo)\b/.test(normalized)) {
     return { type: "SET_PROFILE", profileId: resolveProfileId(normalized) || "secretario" };

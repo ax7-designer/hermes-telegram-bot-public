@@ -99,11 +99,53 @@ test("formatProjectsAscii orders projects by last modification and limits progre
 
   const output = formatProjectsAscii(state, 1);
 
-  assert.match(output, /1\. HIJO DE HERMES/);
-  assert.match(output, /2\. MAE WELLNESS CLUB/);
+  assert.match(output, /1\. \[PIN-1 CYAN\] HIJO DE HERMES/);
+  assert.match(output, /2\. \[PIN-2 VERDE\] MAE WELLNESS CLUB/);
   assert.match(output, /SS\+:/);
   assert.equal((output.match(/Progreso:/g) || []).length, 3);
   assert.doesNotMatch(output, /SHELDON BOT FINANZAS[\s\S]*Progreso:/);
+});
+
+test("formatProjectsAscii exposes Codex Antigravity folder view without chats", () => {
+  const state = createSecretaryState();
+  updateProject(state, 1, "Codex + Antigravity Workspace", {
+    status: "activo",
+    folder: "D:/AI",
+    agents: ["Codex", "Antigravity"],
+    sync: ["Codex: D:/AI", "Antigravity: D:/AI/Hermes/telegram-bot"],
+    chatScope: "fuera del tablero",
+    updatedAt: "2026-06-10T12:00:00.000Z"
+  });
+
+  const output = formatProjectsAscii(state, 1);
+
+  assert.match(output, /1\. \[PIN-1 CYAN\] CODEX \+ ANTIGRAVITY WORKSPACE/);
+  assert.match(output, /Carpeta: D:\/AI/);
+  assert.match(output, /Agentes: Codex \+ Antigravity/);
+  assert.match(output, /Sincronia:/);
+  assert.match(output, /Codex: D:\/AI/);
+  assert.match(output, /Antigravity: D:\/AI\/Hermes\/telegram-bot/);
+  assert.match(output, /Chats: fuera del tablero/);
+});
+
+test("formatProjectsAscii marks only the five most recent projects as pinned with ascii colors", () => {
+  const state = createSecretaryState();
+  for (let i = 1; i <= 6; i++) {
+    updateProject(state, 1, `Proyecto ${i}`, {
+      status: "activo",
+      updatedAt: `2026-06-10T0${i}:00:00.000Z`
+    });
+  }
+
+  const output = formatProjectsAscii(state, 1);
+
+  assert.match(output, /1\. \[PIN-1 CYAN\] PROYECTO 6/);
+  assert.match(output, /2\. \[PIN-2 VERDE\] PROYECTO 5/);
+  assert.match(output, /3\. \[PIN-3 AMBAR\] PROYECTO 4/);
+  assert.match(output, /4\. \[PIN-4 MAGENTA\] PROYECTO 3/);
+  assert.match(output, /5\. \[PIN-5 GRIS\] PROYECTO 2/);
+  assert.match(output, /6\. PROYECTO 1/);
+  assert.doesNotMatch(output, /6\. \[PIN-/);
 });
 
 test("profile helpers keep a voice-first default and support switching roles", () => {
@@ -112,12 +154,16 @@ test("profile helpers keep a voice-first default and support switching roles", (
   assert.equal(getProfile(state, 1).id, "secretario");
   assert.equal(setProfile(state, 1, "tecnico").id, "tecnico");
   assert.equal(getProfile(state, 1).label, "TECNICO");
+  assert.equal(setProfile(state, 1, "director").id, "director");
+  assert.equal(getProfile(state, 1).label, "DIRECTOR HIBRIDO");
 });
 
 test("detectSecretaryIntent maps natural voice phrases to secretary actions", () => {
   assert.deepEqual(detectSecretaryIntent("Hermes, proyectos"), { type: "PROJECTS" });
   assert.deepEqual(detectSecretaryIntent("Hermes, siguiente microaccion"), { type: "NEXT" });
   assert.deepEqual(detectSecretaryIntent("Hermes, perfil tecnico"), { type: "SET_PROFILE", profileId: "tecnico" });
+  assert.deepEqual(detectSecretaryIntent("Hermes, modo director"), { type: "SET_PROFILE", profileId: "director" });
+  assert.deepEqual(detectSecretaryIntent("Hermes, perfil video"), { type: "SET_PROFILE", profileId: "director" });
   assert.deepEqual(detectSecretaryIntent("Hermes, voz"), { type: "VOICE_STATUS" });
 
   const capture = detectSecretaryIntent("Hermes, captura tarea: revisar Render");

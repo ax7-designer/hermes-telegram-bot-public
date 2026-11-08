@@ -19,11 +19,33 @@ const {
   getProfile,
   detectSecretaryIntent
 } = require("./secretary");
+const {
+  isAllowedAction,
+  normalizeActionName,
+  listAllowedActions
+} = require("./safe-actions");
 
 const TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const OR_KEY  = process.env.OPENROUTER_API_KEY;
-const MODEL   = process.env.HERMES_MODEL || "qwen/qwen3-max";
+const MODEL   = process.env.HERMES_MODEL || "deepseek-flash";
 const ALLOWED = process.env.ALLOWED_USER_ID ? Number(process.env.ALLOWED_USER_ID) : null;
+if (!Number.isSafeInteger(ALLOWED) || ALLOWED <= 0) {
+  console.error(chalk.red("[AUTH] ALLOWED_USER_ID falta o no es válido; el bot rechazará todos los usuarios."));
+}
+// Hermes-as-head proxy: OpenAI-compatible endpoint that lets Qoder IDE BYOK (Custom →
+// OpenAI Compatible) treat Hermes itself as the model. Enabled ONLY when HERMES_PROXY_TOKEN
+// is set; existing deployments without the env var stay byte-identical. Sessions are keyed
+// by a virtual chat_id in the range [HERMES_PROXY_CHAT_BASE, +1e6), persisted in the same
+// telegram_chat_history table but never surfaced to the real Telegram chat.
+const HERMES_PROXY_TOKEN = process.env.HERMES_PROXY_TOKEN || null;
+const HERMES_PROXY_CHAT_BASE = Number(process.env.HERMES_PROXY_CHAT_BASE || 9000000001);
+// Sliding-window rate limiter on the proxy endpoints (post-auth). Default 60 req/min = 1
+// msg/seg sostenidos. Sube a 300 si vas a usar el proxy intensivamente en una ráfaga de
+// código. El límite no distingue tokens distintos porque hoy solo hay un token global.
+const HERMES_PROXY_RPM = Math.max(1, Number(process.env.HERMES_PROXY_RPM || 60));
+const HERMES_PROXY_IP_ALLOWLIST = process.env.HERMES_PROXY_ALLOWED_IPS
+  ? new Set(process.env.HERMES_PROXY_ALLOWED_IPS.split(",").map((s) => s.trim()).filter(Boolean))
+  : null;
 const MAX_HISTORY = 60;
 const HTTP_PORT = process.env.PORT || 10000;
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || (TOKEN ? TOKEN.split(":")[1].slice(0, 24) : "bot");
@@ -70,12 +92,51 @@ http.createServer((req, res) => {
         res.end("BAD REQUEST");
       }
     });
+  } else if (HERMES_PROXY_TOKEN && req.method === "GET" && req.url.startsWith("/v1/models")) {
+    const gate = proxyAuthorize(req);
+    if (!gate.ok) {
+      res.writeHead(gate.status, { "Content-Type": "application/json", ...(gate.headers || {}) });
+      res.end(JSON.stringify(gate.body));
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const list = Object.keys(MODELS_CONFIG).map((id) => ({
+      id, object: "model", created: now, owned_by: "hermes-proxy",
+    }));
+    res.writeHead(200, { "Content-Type": "application/json", "X-RateLimit-Limit": String(HERMES_PROXY_RPM), "X-RateLimit-Remaining": String(gate.remaining) });
+    res.end(JSON.stringify({ object: "list", data: list }));
+  } else if (HERMES_PROXY_TOKEN && req.method === "POST" && req.url.startsWith("/v1/chat/completions")) {
+    const gate = proxyAuthorize(req);
+    if (!gate.ok) {
+      res.writeHead(gate.status, { "Content-Type": "application/json", ...(gate.headers || {}) });
+      res.end(JSON.stringify(gate.body));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        await handleHermesProxy(req, res, body);
+      } catch (err) {
+        console.error(chalk.red(`[PROXY ERR] ${err.message}`));
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: err.message, type: "hermes_proxy_error" } }));
+        }
+      }
+    });
   } else {
     res.writeHead(404);
     res.end();
   }
 }).listen(HTTP_PORT, () => {
   console.log(chalk.yellow(`[HTTP] Servidor activo en puerto ${HTTP_PORT} (${USE_TELEGRAM_WEBHOOK ? "webhook" : "polling"})`));
+  if (HERMES_PROXY_TOKEN) {
+    console.log(chalk.cyan(`[HTTP][PROXY] OpenAI-compatible endpoint habilitado en /v1/chat/completions y /v1/models (virtual chat base ${HERMES_PROXY_CHAT_BASE})`));
+    console.log(chalk.cyan(`[HTTP][PROXY] rate limit: ${HERMES_PROXY_RPM} req/min · ip allowlist: ${HERMES_PROXY_IP_ALLOWLIST ? [...HERMES_PROXY_IP_ALLOWLIST].join(",") : "disabled"}`));
+  } else {
+    console.log(chalk.gray(`[HTTP][PROXY] deshabilitado (falta HERMES_PROXY_TOKEN)`));
+  }
 });
 
 
@@ -88,6 +149,25 @@ const openai = new OpenAI({
     "X-Title": "Qwen/Gemini Telegram Bot (ax7.createga)",
   },
 });
+
+// Native DeepSeek Client (direct API — OpenAI-compatible, billed off DeepSeek's own balance)
+// Env: DEEPSEEK_API_KEY. When absent, DeepSeek routes and panel buttons are hidden so existing
+// OpenRouter/Gemini behavior is unchanged.
+const DS_KEY = process.env.DEEPSEEK_API_KEY;
+const deepseek = DS_KEY ? new OpenAI({
+  apiKey: DS_KEY,
+  baseURL: "https://api.deepseek.com",
+}) : null;
+function isDeepSeekModel(modelId) {
+  return typeof modelId === "string" && modelId.startsWith("deepseek-");
+}
+function clientFor(modelId) {
+  if (isDeepSeekModel(modelId)) {
+    if (!deepseek) throw new Error("DEEPSEEK_API_KEY no está configurado en .env");
+    return deepseek;
+  }
+  return openai;
+}
 
 // Native Google AI Studio Client (for 100% Free Gemini Routing)
 const googleGenAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
@@ -137,6 +217,47 @@ REGLAS DE INTERACCIÓN (Estilo Mobile y ADHD-Friendly):
 2. **Concisión**: En Telegram la pantalla es pequeña. Ve directo al grano, elimina la palabrería innecesaria y aporta valor inmediato.
 3. **Agente Proactivo**: Sugiere el siguiente paso lógico. Haz preguntas de clarificación cortas y estimulantes. Actúa con la autonomía e iniciativa de un co-creador estratega.
 4. **Idioma**: Responde siempre en español fluido, natural y con excelente ortografía.`;
+
+const DIRECTOR_DIRECTIVE = `
+────────────────────────────────────────────────────────────────
+🎬 MODO ACTIVO: DIRECTOR DE CONTENIDO HÍBRIDO (ax7.createga)
+────────────────────────────────────────────────────────────────
+Tu misión es transformar notas de voz, ideas de video o conceptos de ax7 en GUIONES DE PRODUCCIÓN HÍBRIDOS (Grabación Humana + Activos IA / UI) de alto impacto.
+
+REGLAS DE FORMATO (ADHD-Friendly, sin paja, listo para producción):
+Cada vez que ax7 envíe una idea o hable sobre video/contenido, responde con la siguiente estructura limpia y segmentada:
+
+1. 🎯 ÁNGULO & GANCHO CONCEPTUAL:
+   • Dolor o deseo específico que ataca (Los 6 Detonantes del "SÍ").
+   • Objetivo de conversión hacia el sitio web (maewellnessclub.com.mx o landing).
+
+2. 📋 GUION TÉCNICO EN TABLA DE TIEMPOS (30-60s):
+   Segmenta el video en 4 bloques:
+   • [0:00 - 0:03] HOOK: Frase verbal exacta + estímulo visual de corte rápido.
+   • [0:03 - 0:15] A-ROLL (ax7): Presencia humana en cámara/voz (empatía, autoridad, revelación).
+   • [0:15 - 0:40] B-ROLL / IA / UI: Capturas del sitio web, interfaz Luxury Dark/Glassmorphism, o animaciones sintéticas.
+   • [0:40 - 0:50] CTA (Llamado a la acción): Indicación clara para probar el sitio web o interactuar.
+
+3. 🧪 HIPÓTESIS DE PRUEBA EN EL SITIO:
+   • Qué elemento del sitio web (landing, registro, pricing, demo) medirá la respuesta de esta pieza.
+
+4. 📦 LISTA DE ASSETS A PREPARAR:
+   • Grabación de ax7 (toma A-Roll requerida).
+   • Prompts / Capturas de pantalla necesarias para el B-Roll IA.
+`;
+
+function getEffectiveSystemPrompt(chatId) {
+  if (!chatId) return SYSTEM_PROMPT;
+  try {
+    const profile = getProfile(secretaryState, chatId);
+    if (profile && profile.id === "director") {
+      return `${SYSTEM_PROMPT}\n\n${DIRECTOR_DIRECTIVE}`;
+    }
+  } catch {
+    // Fallback seguro a SYSTEM_PROMPT base
+  }
+  return SYSTEM_PROMPT;
+}
 
 // ─── Hermes Feedback Bitácora ──────────────────────────────────────────────────
 const HERMES_LEARNING_NOTES = [
@@ -209,6 +330,21 @@ const MODELS_CONFIG = {
     short: "Qwen 3 Coder",
     inputPrice: 0.11,
     outputPrice: 0.80
+  },
+  // Direct DeepSeek routes — billed off DeepSeek balance, not OpenRouter.
+  // Prices below are OFF-PEAK per 1M tokens (peak is 2×; peak hours: 01-04 UTC y 06-10 UTC Lun-Vie).
+  // Source: https://api-docs.deepseek.com/quick_start/pricing (consultado 2026-11-06)
+  "deepseek-flash": {
+    name: "DeepSeek Flash V4.1 (Directo · off-peak $0.15/$0.60)",
+    short: "DeepSeek Flash",
+    inputPrice: 0.15,
+    outputPrice: 0.60
+  },
+  "deepseek-v4-pro": {
+    name: "DeepSeek V4 Pro (Directo · off-peak $0.66/$1.98)",
+    short: "DeepSeek V4 Pro",
+    inputPrice: 0.66,
+    outputPrice: 1.98
   }
 };
 
@@ -283,8 +419,14 @@ async function saveHistory(chatId, history) {
 
 // ─── Auth guard ───────────────────────────────────────────────────────────────
 function isAllowed(userId) {
-  if (!ALLOWED) return true;
-  return userId === ALLOWED;
+  return Number.isSafeInteger(ALLOWED) && ALLOWED > 0 && userId === ALLOWED;
+}
+
+function onAuthorizedText(regex, handler) {
+  bot.onText(regex, async (msg, match) => {
+    if (!isAllowed(msg.from?.id)) return;
+    await handler(msg, match);
+  });
 }
 
 // ─── OpenRouter Credits Tracker ───────────────────────────────────────────────
@@ -313,6 +455,150 @@ async function fetchBalance() {
   return "N/A";
 }
 
+// ─── DeepSeek direct-API balance (only used when DS_KEY is set) ────────────────────
+// Docs: GET https://api.deepseek.com/user/balance with Authorization: Bearer <key>
+// Response shape (2026-11-06): { is_available: true, balance_infos: [{ currency, total_balance, granted_balance, topped_up_balance }] }. Older docs used is_balance_set / balance_info; we accept either.
+// DeepSeek consumes granted_balance FIRST; topped_up_balance is the money the user actually paid.
+async function getDSBalanceRaw() {
+  if (!DS_KEY) return { ok: false, reason: "no_key" };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+  try {
+    const res = await fetch("https://api.deepseek.com/user/balance", {
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${DS_KEY}` },
+    });
+    if (!res.ok) return { ok: false, reason: `HTTP ${res.status}`, httpStatus: res.status };
+    const json = await res.json();
+    const available = json && (json.is_available === true || json.is_balance_set === true);
+    if (!available) return { ok: false, reason: "balance_unavailable", raw: json };
+    const list = Array.isArray(json.balance_infos) ? json.balance_infos
+               : Array.isArray(json.balance_info) ? json.balance_info : null;
+    if (!list || list.length === 0) return { ok: false, reason: "no_balance_infos", raw: json };
+    const info = list[0];
+    const toNum = (v) => (v == null ? null : Number(v));
+    return {
+      ok: true,
+      currency: info.currency || "USD",
+      totalBalance: toNum(info.total_balance),
+      grantedBalance: toNum(info.granted_balance),
+      toppedUpBalance: toNum(info.topped_up_balance),
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch (err) {
+    return { ok: false, reason: String((err && err.message) || err) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchDSBalance() {
+  if (!DS_KEY) return null;
+  const r = await getDSBalanceRaw();
+  if (!r.ok) {
+    if (r.httpStatus) return `HTTP ${r.httpStatus}`;
+    return r.reason === "balance_not_set" ? "(sin saldo aún)" : "N/A";
+  }
+  return `$${(r.totalBalance ?? 0).toFixed(4)} ${r.currency}`;
+}
+
+// USD originally invested by the user. Used by /gasto to compute the real burn rate
+// against DeepSeek's topped_up_balance (which excludes any granted credit).
+const DS_INVESTED_USD = Number(process.env.DEEPSEEK_INVESTED_USD || 0);
+
+function formatGasto(bal, invested) {
+  if (!bal.ok) {
+    return `\u26a0\ufe0f No pude consultar el saldo DeepSeek: \`${bal.reason}\`.` +
+      (bal.httpStatus === 401 ? "\n\nRevisa que la API key est\u00e9 bien pegada en `.env`." : "");
+  }
+  const spentOwn = invested > 0 ? (invested - (bal.toppedUpBalance ?? 0)) : null;
+  const spentPct = invested > 0 && spentOwn != null
+    ? Math.max(0, Math.min(100, (spentOwn / invested) * 100))
+    : null;
+  const ccy = bal.currency;
+  let s = `\ud83d\udcb0 *Gasto DeepSeek* (off-peak, flash)\n\n`;
+  s += `\u2022 Invertido (top-up): \`${invested > 0 ? `$${invested.toFixed(2)}` : "desconocido"} ${ccy}\`\n`;
+  s += `\u2022 Saldo disponible total: \`$${(bal.totalBalance ?? 0).toFixed(4)} ${ccy}\`\n`;
+  s += `  \u2013 De tu bolsillo (topped_up): \`$${(bal.toppedUpBalance ?? 0).toFixed(4)} ${ccy}\`\n`;
+  s += `  \u2013 De regalo (granted): \`$${(bal.grantedBalance ?? 0).toFixed(4)} ${ccy}\`\n`;
+  if (spentOwn !== null && spentOwn >= 0) {
+    s += `\u2022 *Gastado de tu bolsillo:* \`$${spentOwn.toFixed(4)} ${ccy}\``;
+    if (spentPct !== null) s += ` \`(${spentPct.toFixed(1)}%)\``;
+    s += `\n`;
+  }
+  if (bal.totalBalance != null) {
+    const tokensAvail = Math.floor((bal.totalBalance / 0.60) * 1000000);
+    const rafagasAvail = Math.floor(tokensAvail / 500000);
+    s += `\u2022 Runway a flash off-peak: ~\`${tokensAvail.toLocaleString("en-US")}\` tokens de salida \u2192 ~\`${rafagasAvail}\` r\u00e1fagas de 500K\n`;
+  }
+  s += `\n_\u00daltima lectura: \`${bal.fetchedAt}\` \u00b7 Fuente: \`/user/balance\`_`;
+  if (invested === 0) {
+    s += `\n\n_Para calcular % gastado: define_ \`DEEPSEEK_INVESTED_USD=15\` _en_ \`.env\` _y reinicia el bot._`;
+  }
+  return s;
+}
+
+function buildBalanceLines(orStr, dsStr) {
+  let s = `• *Saldo OpenRouter:* \`${orStr}\`\n`;
+  if (dsStr !== null) s += `• *Saldo DeepSeek:*  \`${dsStr}\`\n`;
+  return s + "\n";
+}
+
+// ─── Per-source USD spend attribution (hermes_proxy_usage) ───────────────────
+// Append-only metric so /gasto can split burn by 'telegram' vs 'proxy' (Qoder).
+// Fully best-effort: if the table is absent (proxy_usage.sql not applied yet) the
+// insert/select fail quietly and nothing else changes. estUsd uses MODELS_CONFIG
+// list prices; the authoritative total remains DeepSeek /user/balance.
+async function recordUsage({ source, chatId, modelId, promptTokens = 0, completionTokens = 0, estUsd = 0, estimated = false }) {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase.from("hermes_proxy_usage").insert({
+      source,
+      chat_id: chatId ?? null,
+      model_id: modelId ?? null,
+      prompt_tokens: Math.round(promptTokens) || 0,
+      completion_tokens: Math.round(completionTokens) || 0,
+      est_usd: Number(estUsd) || 0,
+      estimated: !!estimated,
+    });
+    if (error) throw error;
+  } catch (err) {
+    console.error(chalk.gray(`[USAGE] registro omitido (¿falta proxy_usage.sql?): ${err.message}`));
+  }
+}
+
+function usageCost(cfg, usage) {
+  if (!cfg || !usage) return 0;
+  return ((usage.prompt_tokens || 0) / 1e6) * (cfg.inputPrice || 0)
+       + ((usage.completion_tokens || 0) / 1e6) * (cfg.outputPrice || 0);
+}
+
+async function fetchTodayUsageBreakdown() {
+  if (!supabase) return null;
+  try {
+    const since = new Date();
+    since.setUTCHours(0, 0, 0, 0);
+    const { data, error } = await supabase
+      .from("hermes_proxy_usage")
+      .select("source, est_usd, prompt_tokens, completion_tokens, estimated")
+      .gte("created_at", since.toISOString());
+    if (error) return null; // table not created yet → caller omits the section
+    const agg = {};
+    for (const r of (data || [])) {
+      const k = r.source || "unknown";
+      agg[k] = agg[k] || { usd: 0, reqs: 0, tokens: 0, anyEst: false };
+      agg[k].usd += Number(r.est_usd) || 0;
+      agg[k].reqs += 1;
+      agg[k].tokens += (Number(r.prompt_tokens) || 0) + (Number(r.completion_tokens) || 0);
+      if (r.estimated) agg[k].anyEst = true;
+    }
+    return { rows: data || [], agg, since: since.toISOString() };
+  } catch (_) {
+    return null;
+  }
+}
+
+
 // ─── Core AI Router (Dual Engine: Google Native SDK / OpenRouter API) ────────
 async function askAI(chatId, userMessage) {
   const history = await loadHistory(chatId);
@@ -333,7 +619,7 @@ async function askAI(chatId, userMessage) {
       
       const geminiModel = googleGenAI.getGenerativeModel({
         model: "gemini-2.5-flash",
-        systemInstruction: SYSTEM_PROMPT
+        systemInstruction: getEffectiveSystemPrompt(chatId)
       });
 
       const googleHistory = history.map(h => ({
@@ -370,25 +656,47 @@ async function askAI(chatId, userMessage) {
   }
 
   // 2. OpenRouter Execution Path (Qwen/Claude, o Fallback Activo de Gemini)
-  const finalModelId = (modelId === "google/gemini-2.5-flash") ? "qwen/qwen3-coder-next" : modelId;
-  const finalConfig = MODELS_CONFIG[finalModelId] || config;
+  const primaryModelId = (modelId === "google/gemini-2.5-flash") ? "qwen/qwen3-coder-next" : modelId;
+  let finalModelId = primaryModelId;
+  let finalConfig = MODELS_CONFIG[finalModelId] || config;
+  let deepSeekFailed = false;
 
-  console.log(chalk.blue(`🤖 Ejecutando enrutamiento OpenRouter con modelo: ${finalModelId}...`));
+  console.log(chalk.blue(`🤖 Ejecutando enrutamiento OpenRouter/DeepSeek con modelo: ${finalModelId}...`));
 
   history.push({ role: "user", content: userMessage });
   trimHistory(history);
 
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: getEffectiveSystemPrompt(chatId) },
     ...history,
   ];
 
-  const response = await openai.chat.completions.create({
+  const sdkParams = {
     model: finalModelId,
     messages,
     max_tokens: 1536,
     temperature: 0.7,
-  });
+  };
+
+  let response;
+  try {
+    response = await clientFor(finalModelId).chat.completions.create(sdkParams);
+  } catch (err) {
+    // Fallback silencioso para DeepSeek 5xx/429 → OpenRouter Qwen Coder (asimetría con
+    // el proxy HTTP en handleHermesProxy, que ya hace lo mismo). Si el fallback también
+    // falla, propagar.
+    const status = err?.status || err?.response?.status || 0;
+    const looksUpstream = status >= 500 || status === 429 || /5\d\d|timeout|ETIMEDOUT|ENOTFOUND/i.test(String(err?.message || ""));
+    if (isDeepSeekModel(finalModelId) && looksUpstream) {
+      console.error(chalk.yellow(`⚠️ DeepSeek ${status || "?"} (${err.message}). Fallback silencioso a qwen/qwen3-coder-next...`));
+      finalModelId = "qwen/qwen3-coder-next";
+      finalConfig = MODELS_CONFIG[finalModelId];
+      deepSeekFailed = true;
+      response = await openai.chat.completions.create({ ...sdkParams, model: finalModelId });
+    } else {
+      throw err;
+    }
+  }
 
   const replyText = response.choices[0]?.message?.content || "_(sin respuesta)_";
   history.push({ role: "assistant", content: replyText });
@@ -401,47 +709,345 @@ async function askAI(chatId, userMessage) {
     const outputCost = (response.usage.completion_tokens / 1000000) * finalConfig.outputPrice;
     const totalCost = inputCost + outputCost;
     costStr = `$${totalCost.toFixed(6)}`;
+    recordUsage({
+      source: "telegram",
+      chatId,
+      modelId: finalModelId,
+      promptTokens: response.usage.prompt_tokens,
+      completionTokens: response.usage.completion_tokens,
+      estUsd: totalCost,
+    });
   }
 
   const balanceStr = await fetchBalance();
+  const dsBalanceStr = isDeepSeekModel(finalModelId) ? await fetchDSBalance() : null;
+  const balanceLabel = dsBalanceStr ? `💳 *Saldo DS:* \`${dsBalanceStr}\`` : `💳 *Saldo OR:* \`${balanceStr}\``;
   const hermesNote = getRandomHermesNote();
 
-  const wasFallback = (modelId === "google/gemini-2.5-flash");
+  const wasGeminiFallback = (modelId === "google/gemini-2.5-flash");
+  const wasFallback = wasGeminiFallback || deepSeekFailed;
   const headerBar = wasFallback ? `─── *THE WISE PIPELINE (FALLBACK ACTIVE)* ───` : `─── *THE WISE PIPELINE* ───`;
+  const fallbackTag = wasGeminiFallback
+    ? ' ⚠️ (Quota limit - Fallback a Qwen)'
+    : deepSeekFailed ? ' ⚠️ (DeepSeek 5xx - Fallback a Qwen Coder)' : '';
 
   const footer = `\n\n` +
                  `${headerBar}\n` +
-                 `💳 *Saldo OR:* \`${balanceStr}\` | 🪙 *Costo msg:* \`${costStr}\`\n` +
-                 `🤖 *Modelo:* \`${finalConfig.short}\`${wasFallback ? ' ⚠️ (Quota limit - Fallback a Qwen)' : ''}\n` +
+                 `${balanceLabel} | 🪙 *Costo msg:* \`${costStr}\`\n` +
+                 `🤖 *Modelo:* \`${finalConfig.short}\`${fallbackTag}\n` +
                  `🧠 *Bitácora Hermes:* _${hermesNote}_`;
 
   return replyText + footer;
 }
 
-// ─── Format model name for display ───────────────────────────────────────────
+// ─── Hermes-as-head proxy: OpenAI-compatible completions handler ─────────
+// Enabled when HERMES_PROXY_TOKEN is set. Qoder IDE BYOK (Custom → OpenAI Compatible)
+// points at `http://localhost:10000/v1` (local) or the Render URL + /v1 (cloud), and its
+// API key = HERMES_PROXY_TOKEN. Then whatever model is active on Hermes' Telegram panel
+// becomes literally the model Qoder talks to — DeepSeek, Qwen, Claude and the fallback
+// routes all reachable through the same clientFor() dispatcher. History persists to
+// Supabase under a virtual chat_id so the Qoder session has continuity across restarts,
+// but it never leaks into the real Telegram chat.
+// Sliding-window rate limiter + bearer auth + optional IP allowlist for the proxy.
+// Returns `{ ok: true, remaining }` or `{ ok: false, status, body, headers }` ready to
+// write. Requests are tracked in one global bucket because today we only support a
+// single HERMES_PROXY_TOKEN — if we ever split per-user, key the array by bearer hash.
+const proxyRecentRequests = [];
+function extractProxyIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (typeof fwd === "string" && fwd.length) return fwd.split(",")[0].trim();
+  return req.socket?.remoteAddress || "";
+}
+function proxyAuthorize(req) {
+  const authHeader = req.headers["authorization"] || "";
+  const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (bearer !== HERMES_PROXY_TOKEN) {
+    return { ok: false, status: 401, body: { error: { message: "invalid proxy token", type: "auth_error" } } };
+  }
+  if (HERMES_PROXY_IP_ALLOWLIST) {
+    const ip = extractProxyIp(req);
+    // localhost in IPv4/IPv6 is always allowed to keep local dev friction low
+    const isLocal = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+    if (!isLocal && !HERMES_PROXY_IP_ALLOWLIST.has(ip)) {
+      return { ok: false, status: 403, body: { error: { message: `ip ${ip} not in HERMES_PROXY_ALLOWED_IPS`, type: "ip_denied" } } };
+    }
+  }
+  const now = Date.now();
+  const windowMs = 60_000;
+  while (proxyRecentRequests.length && proxyRecentRequests[0] < now - windowMs) {
+    proxyRecentRequests.shift();
+  }
+  if (proxyRecentRequests.length >= HERMES_PROXY_RPM) {
+    const retryAfterSec = Math.max(1, Math.ceil((proxyRecentRequests[0] + windowMs - now) / 1000));
+    console.warn(chalk.yellow(`[PROXY RL] 429 rate limited, retry-after ${retryAfterSec}s`));
+    return {
+      ok: false,
+      status: 429,
+      headers: { "Retry-After": String(retryAfterSec), "X-RateLimit-Limit": String(HERMES_PROXY_RPM), "X-RateLimit-Remaining": "0" },
+      body: { error: { message: `rate limited: ${HERMES_PROXY_RPM} req/min`, type: "rate_limited", retry_after_seconds: retryAfterSec } },
+    };
+  }
+  proxyRecentRequests.push(now);
+  return { ok: true, remaining: Math.max(0, HERMES_PROXY_RPM - proxyRecentRequests.length) };
+}
+
+function proxyChatIdFrom(req) {
+  const sid = req.headers["x-hermes-session-id"];
+  if (!sid) return HERMES_PROXY_CHAT_BASE;
+  // FNV-1a 32-bit, folded into the virtual range. Different Qoder conversation windows
+  // (each with its own X-Hermes-Session-Id) get their own history bucket.
+  let h = 2166136261;
+  for (let i = 0; i < sid.length; i++) {
+    h ^= sid.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return HERMES_PROXY_CHAT_BASE + (h % 1000000);
+}
+
+async function handleHermesProxy(req, res, rawBody) {
+  let parsed;
+  try { parsed = JSON.parse(rawBody || "{}"); }
+  catch (e) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: { message: `invalid JSON body: ${e.message}` } }));
+  }
+  const inMessages = Array.isArray(parsed.messages) ? parsed.messages : [];
+  if (inMessages.length === 0) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: { message: "messages[] is required" } }));
+  }
+  if (parsed.stream && typeof parsed.stream !== "boolean") {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: { message: "stream must be boolean" } }));
+  }
+  // If we're in stream mode and the caller's client doesn't send Accept: text/event-stream,
+  // we still honor it — Qoder BYOK sometimes omits the header and expects chunked SSE anyway.
+
+  const virtualChatId = proxyChatIdFrom(req);
+  // Explicit model in the body wins if we know it. Otherwise fall through to whatever
+  // the Telegram panel currently has selected for this virtual chat (defaults to MODEL).
+  const requested = parsed.model;
+  let modelId = (requested && MODELS_CONFIG[requested]) ? requested : (activeModels.get(virtualChatId) || MODEL);
+  if (!MODELS_CONFIG[modelId]) modelId = MODEL;
+  if (modelId === "google/gemini-3.1-pro-preview") modelId = "google/gemini-2.5-flash";
+
+  const lastUser = [...inMessages].reverse().find((m) => m && m.role === "user");
+  const userText = typeof lastUser?.content === "string"
+    ? lastUser.content
+    : Array.isArray(lastUser?.content)
+      ? lastUser.content.filter((p) => p.type === "text").map((p) => p.text).join("\n")
+      : "";
+  if (!userText) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: { message: "no user text content in messages[]" } }));
+  }
+
+  const history = await loadHistory(virtualChatId);
+  history.push({ role: "user", content: userText });
+  trimHistory(history);
+
+  const outbound = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...history,
+  ];
+
+  const params = {
+    model: modelId,
+    messages: outbound,
+    max_tokens: parsed.max_tokens || 1536,
+    temperature: typeof parsed.temperature === "number" ? parsed.temperature : 0.7,
+  };
+
+  // ── Streaming branch: OpenAI-compatible Server-Sent Events ─────────────────
+  if (parsed.stream) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    const created = Math.floor(Date.now() / 1000);
+    const sendChunk = (obj) => { try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (_) {} };
+    const firstChunkMeta = {
+      id: `hermes_${Date.now()}`,
+      object: "chat.completion.chunk",
+      created,
+      model: modelId,
+    };
+    // Emit the initial role-delta so strict OpenAI clients can allocate choice 0
+    sendChunk({ ...firstChunkMeta, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+
+    let stream;
+    let finalModelId = modelId;
+    try {
+      stream = await clientFor(modelId).chat.completions.create({ ...params, stream: true });
+    } catch (err) {
+      const status = err?.status || err?.response?.status || 0;
+      const looksUpstream = status >= 500 || status === 429 || /5\d\d|timeout|ETIMEDOUT/i.test(String(err?.message || ""));
+      if (isDeepSeekModel(modelId) && looksUpstream) {
+        console.error(chalk.yellow(`[PROXY STREAM] DeepSeek ${status || "?"} → fallback qwen/qwen3-coder-next (single-chunk)`));
+        finalModelId = "qwen/qwen3-coder-next";
+        let full;
+        try {
+          full = await openai.chat.completions.create({ ...params, model: finalModelId });
+        } catch (err2) {
+          sendChunk({ ...firstChunkMeta, model: finalModelId, choices: [{ index: 0, delta: { content: "" }, finish_reason: "error" }] });
+          res.write("data: [DONE]\n\n");
+          return res.end();
+        }
+        const fallbackMessage = full.choices?.[0]?.message || {};
+        const text = fallbackMessage.content || fallbackMessage.reasoning_content || "";
+        sendChunk({ id: full.id || firstChunkMeta.id, object: "chat.completion.chunk", created: full.created || created, model: finalModelId, choices: [{ index: 0, delta: { content: text }, finish_reason: "stop" }] });
+        history.push({ role: "assistant", content: text });
+        trimHistory(history);
+        await saveHistory(virtualChatId, history);
+        const hasUsage = Number.isFinite(full.usage?.prompt_tokens)
+          && Number.isFinite(full.usage?.completion_tokens);
+        const promptTokens = hasUsage
+          ? full.usage.prompt_tokens
+          : Math.round(JSON.stringify(params.messages || "").length / 4);
+        const completionTokens = hasUsage
+          ? full.usage.completion_tokens
+          : Math.round(text.length / 4);
+        recordUsage({
+          source: "proxy",
+          chatId: virtualChatId,
+          modelId: finalModelId,
+          promptTokens,
+          completionTokens,
+          estUsd: usageCost(MODELS_CONFIG[finalModelId], {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+          }),
+          estimated: !hasUsage,
+        });
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      // Non-fallback failure: emit a delta with empty content and finish_reason=error, then DONE
+      sendChunk({ ...firstChunkMeta, choices: [{ index: 0, delta: { content: "" }, finish_reason: "error" }] });
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    let accumulated = "";
+    let chunkId = firstChunkMeta.id;
+    try {
+      for await (const chunk of stream) {
+        if (chunk.id) chunkId = chunk.id;
+        const deltaText = chunk.choices?.[0]?.delta?.content || chunk.choices?.[0]?.delta?.reasoning_content || "";
+        if (deltaText) accumulated += deltaText;
+        sendChunk({
+          id: chunk.id || chunkId,
+          object: "chat.completion.chunk",
+          created: chunk.created || created,
+          model: chunk.model || finalModelId,
+          choices: [{
+            index: 0,
+            delta: deltaText ? { content: deltaText } : {},
+            finish_reason: chunk.choices?.[0]?.finish_reason || null,
+          }],
+        });
+      }
+    } catch (streamErr) {
+      console.error(chalk.red(`[PROXY STREAM] mid-stream error: ${streamErr.message}`));
+      sendChunk({ id: chunkId, object: "chat.completion.chunk", created, model: finalModelId, choices: [{ index: 0, delta: {}, finish_reason: "error" }] });
+    }
+
+    history.push({ role: "assistant", content: accumulated });
+    trimHistory(history);
+    await saveHistory(virtualChatId, history);
+    // Streaming responses don't reliably carry a usage object (that would need
+    // stream_options.include_usage, which can perturb strict SSE clients), so record a
+    // length-based token estimate flagged estimated=true. Attribution only.
+    recordUsage({
+      source: "proxy",
+      chatId: virtualChatId,
+      modelId: finalModelId,
+      promptTokens: Math.round((JSON.stringify(params.messages || "").length) / 4),
+      completionTokens: Math.round(accumulated.length / 4),
+      estUsd: usageCost(MODELS_CONFIG[finalModelId] || { inputPrice: 0.40, outputPrice: 1.20 }, {
+        prompt_tokens: Math.round((JSON.stringify(params.messages || "").length) / 4),
+        completion_tokens: Math.round(accumulated.length / 4),
+      }),
+      estimated: true,
+    });
+    res.write("data: [DONE]\n\n");
+    return res.end();
+  }
+  // ── End streaming branch ───────────────────────────────────────────
+
+  let response, finalModelId = modelId;
+  try {
+    response = await clientFor(modelId).chat.completions.create(params);
+  } catch (err) {
+    // Silent fallback to Qwen coder on DeepSeek 5xx/429, mirroring the Gemini fallback
+    // pattern in askAI. Retries once; if the fallback also fails, throw.
+    const status = err?.status || err?.response?.status || 0;
+    const looksUpstream = status >= 500 || status === 429 || /5\d\d|timeout|ETIMEDOUT/i.test(String(err?.message || ""));
+    if (isDeepSeekModel(modelId) && looksUpstream) {
+      console.error(chalk.yellow(`[PROXY] DeepSeek ${status || "?"} → fallback qwen/qwen3-coder-next`));
+      finalModelId = "qwen/qwen3-coder-next";
+      response = await openai.chat.completions.create({ ...params, model: finalModelId });
+    } else {
+      throw err;
+    }
+  }
+
+  const rawMsg = response.choices?.[0]?.message || {};
+  // DeepSeek thinking models return the visible answer in `content` and the chain-of-
+  // thought in `reasoning_content`. Forward both (OpenAI-compatible clients ignore the
+  // extra field; thinking-aware ones like Qoder render it). If content is empty but
+  // reasoning exists (caller's max_tokens was too tight to finish thinking), surface the
+  // reasoning so the client never gets a fully blank assistant turn.
+  const replyText = rawMsg.content || rawMsg.reasoning_content || "";
+  history.push({ role: "assistant", content: replyText });
+  trimHistory(history);
+  await saveHistory(virtualChatId, history);
+
+  const usage = response.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  recordUsage({
+    source: "proxy",
+    chatId: virtualChatId,
+    modelId: finalModelId,
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    estUsd: usageCost(MODELS_CONFIG[finalModelId] || { inputPrice: 0.40, outputPrice: 1.20 }, usage),
+  });
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    id: response.id || `hermes_${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: finalModelId,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: rawMsg.content || rawMsg.reasoning_content || "",
+        ...(rawMsg.reasoning_content ? { reasoning_content: rawMsg.reasoning_content } : {}),
+      },
+      finish_reason: response.choices?.[0]?.finish_reason || "stop",
+    }],
+    usage,
+    hermes: {
+      virtualChatId,
+      fallbackUsed: finalModelId !== modelId,
+      note: "Hermes-as-head proxy. Billed to the same DeepSeek/OpenRouter balance as Telegram.",
+    },
+  }));
+}
+
+// ─── Format model name for display ────────────────────────────────────
 function shortModel(m) {
   return m.split("/").pop().replace(":nitro", " ⚡");
 }
 
-// ─── Command Execution Helpers (Visual Actions) ──────────────────────────────────
-async function showModelPanel(chatId) {
-  let currentModelId = activeModels.get(chatId) || MODEL;
-  if (currentModelId === "google/gemini-3.1-pro-preview") {
-    currentModelId = "google/gemini-2.5-flash";
-    activeModels.set(chatId, "google/gemini-2.5-flash");
-  }
-
-  const config = getModelConfig(chatId);
-  const balanceStr = await fetchBalance();
-
-  const menuText = `🤖 *PANEL DE CONTROL (The Wise Pipeline)*\n\n` +
-                   `• *Modelo Activo:* \`${config.name}\`\n` +
-                   `• *ID Técnico:* \`${currentModelId}\`\n` +
-                   `• *Precios (1M tokens):* Entrada \`$${config.inputPrice.toFixed(2)}\` | Salida \`$${config.outputPrice.toFixed(2)}\` ${currentModelId === 'google/gemini-2.5-flash' ? '\n🔥 _¡Coste Cero! Llamada directa gratis via tu API Key de Google._' : ''}\n` +
-                   `• *Saldo OpenRouter:* \`${balanceStr}\`\n\n` +
-                   `👉 *Selecciona un modelo tocando las opciones del panel:*`;
-
-  const inlineKeyboard = [
+// ─── Build the Telegram inline model panel ────────────────────────────────────
+// DeepSeek rows appear only when DEEPSEEK_API_KEY is present, so the Render deploy (which
+// doesn't have the key yet) keeps the exact same panel as before.
+function buildModelKeyboard(currentModelId) {
+  const rows = [
     [
       { text: `🧠 Qwen 3 Max ($0.78/$3.90) ${currentModelId === 'qwen/qwen3-max' ? '✅' : ''}`, callback_data: 'set_model:qwen' }
     ],
@@ -455,6 +1061,37 @@ async function showModelPanel(chatId) {
       { text: `⚡ Qwen 3 Coder ($0.11/$0.80) ${currentModelId === 'qwen/qwen3-coder-next' ? '✅' : ''}`, callback_data: 'set_model:flash' }
     ]
   ];
+  if (deepseek) {
+    rows.push([
+      { text: `🐋 DeepSeek Flash ($0.15/$0.60 off-peak) ${currentModelId === 'deepseek-flash' ? '✅' : ''}`, callback_data: 'set_model:ds' }
+    ]);
+    rows.push([
+      { text: `🚀 DeepSeek V4 Pro ($0.66/$1.98 off-peak) ${currentModelId === 'deepseek-v4-pro' ? '✅' : ''}`, callback_data: 'set_model:dspro' }
+    ]);
+  }
+  return rows;
+}
+
+// ─── Command Execution Helpers (Visual Actions) ──────────────────────────────────
+async function showModelPanel(chatId) {
+  let currentModelId = activeModels.get(chatId) || MODEL;
+  if (currentModelId === "google/gemini-3.1-pro-preview") {
+    currentModelId = "google/gemini-2.5-flash";
+    activeModels.set(chatId, "google/gemini-2.5-flash");
+  }
+
+  const config = getModelConfig(chatId);
+  const balanceStr = await fetchBalance();
+  const dsBalanceStr = await fetchDSBalance();
+
+  const menuText = `🤖 *PANEL DE CONTROL (The Wise Pipeline)*\n\n` +
+                   `• *Modelo Activo:* \`${config.name}\`\n` +
+                   `• *ID Técnico:* \`${currentModelId}\`\n` +
+                   `• *Precios (1M tokens):* Entrada \`$${config.inputPrice.toFixed(2)}\` | Salida \`$${config.outputPrice.toFixed(2)}\` ${currentModelId === 'google/gemini-2.5-flash' ? '\n🔥 _¡Coste Cero! Llamada directa gratis via tu API Key de Google._' : ''}\n` +
+                   buildBalanceLines(balanceStr, dsBalanceStr) +
+                   `👉 *Selecciona un modelo tocando las opciones del panel:*`;
+
+  const inlineKeyboard = buildModelKeyboard(currentModelId);
 
   bot.sendMessage(chatId, menuText, {
     parse_mode: "Markdown",
@@ -609,7 +1246,7 @@ async function runStatusCheck(chatId) {
       const result = await geminiModel.generateContent("Reply with exactly: OK");
       reply = result.response.text();
     } else {
-      const ping = await openai.chat.completions.create({
+      const ping = await clientFor(currentModelId).chat.completions.create({
         model: currentModelId,
         messages: [{ role: "user", content: "Reply with exactly: OK" }],
         max_tokens: 5,
@@ -631,7 +1268,7 @@ async function runStatusCheck(chatId) {
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
-bot.onText(/\/start/, (msg) => {
+onAuthorizedText(/\/start/, (msg) => {
   const name = msg.from.first_name || "allí";
   bot.sendMessage(
     msg.chat.id,
@@ -666,11 +1303,11 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-bot.onText(/\/help/, (msg) => {
+onAuthorizedText(/\/help/, (msg) => {
   showHelp(msg.chat.id);
 });
 
-bot.onText(/\/id/, (msg) => {
+onAuthorizedText(/\/id/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     [
@@ -681,7 +1318,7 @@ bot.onText(/\/id/, (msg) => {
   );
 });
 
-bot.onText(/\/reset/, async (msg) => {
+onAuthorizedText(/\/reset/, async (msg) => {
   await saveHistory(msg.chat.id, []);
   bot.sendMessage(
     msg.chat.id,
@@ -690,35 +1327,35 @@ bot.onText(/\/reset/, async (msg) => {
   );
 });
 
-bot.onText(/\/model/, async (msg) => {
+onAuthorizedText(/\/model/, async (msg) => {
   await showModelPanel(msg.chat.id);
 });
 
-bot.onText(/^\/captura(?:\s+([\s\S]+))?$/, async (msg, match) => {
+onAuthorizedText(/^\/captura(?:\s+([\s\S]+))?$/, async (msg, match) => {
   await handleSecretaryCapture(msg.chat.id, match && match[1]);
 });
 
-bot.onText(/^\/hoy$/, async (msg) => {
+onAuthorizedText(/^\/hoy$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, formatTodayAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
 });
 
-bot.onText(/^\/siguiente$/, async (msg) => {
+onAuthorizedText(/^\/siguiente$/, async (msg) => {
   await showNextAction(msg.chat.id);
 });
 
-bot.onText(/^\/cierre$/, async (msg) => {
+onAuthorizedText(/^\/cierre$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, formatCloseAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
 });
 
-bot.onText(/^\/proyectos$/, async (msg) => {
+onAuthorizedText(/^\/proyectos$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, formatProjectsAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
 });
 
-bot.onText(/^\/perfiles$/, async (msg) => {
+onAuthorizedText(/^\/perfiles$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, formatProfilesAscii(secretaryState, msg.chat.id), { parse_mode: "Markdown" });
 });
 
-bot.onText(/^\/perfil(?:\s+(.+))?$/, async (msg, match) => {
+onAuthorizedText(/^\/perfil(?:\s+(.+))?$/, async (msg, match) => {
   const input = match && match[1] ? match[1].trim() : "";
   if (!input) {
     await showActiveProfile(msg.chat.id);
@@ -728,14 +1365,56 @@ bot.onText(/^\/perfil(?:\s+(.+))?$/, async (msg, match) => {
   await changeProfile(msg.chat.id, input);
 });
 
-bot.onText(/^\/voz$/, async (msg) => {
+onAuthorizedText(/^\/director$/, async (msg) => {
+  await changeProfile(msg.chat.id, "director");
+});
+
+onAuthorizedText(/^\/voz$/, async (msg) => {
   await bot.sendMessage(msg.chat.id, formatVoiceStatusAscii(), { parse_mode: "Markdown" });
+});
+
+onAuthorizedText(/^\/gasto$/, async (msg) => {
+  if (!DS_KEY) {
+    await bot.sendMessage(msg.chat.id,
+      "\u26a0\ufe0f Sin `DEEPSEEK_API_KEY` en `.env` \u2014 no puedo consultar /user/balance.",
+      { parse_mode: "Markdown" });
+    return;
+  }
+  const statusMsg = await bot.sendMessage(msg.chat.id, "\u23f3 Consultando saldo DeepSeek\u2026");
+  const bal = await getDSBalanceRaw();
+  let text = formatGasto(bal, DS_INVESTED_USD);
+  const brk = await fetchTodayUsageBreakdown();
+  if (brk && brk.rows.length > 0) {
+    const line = (label, a) => a
+      ? `\u2022 ${label}: \`$${a.usd.toFixed(5)}\` \u00b7 ${a.reqs} turns \u00b7 ~${a.tokens.toLocaleString("en-US")} tok${a.anyEst ? " (incl. est.)" : ""}`
+      : null;
+    const parts = [
+      line("\ud83d\udcf1 Telegram", brk.agg.telegram),
+      line("\ud83d\udcbb Qoder (proxy)", brk.agg.proxy),
+    ].filter(Boolean);
+    if (parts.length) text += `\n\n\ud83d\udccd *Por d\u00f3nde hoy (UTC, costo estimado por lista):*\n${parts.join("\n")}`;
+  } else if (brk === null) {
+    text += `\n\n\u2139\ufe0f *Breakdown por fuente:* no disponible (falta aplicar \`proxy_usage.sql\` en Supabase).`;
+  }
+  await bot.editMessageText(text, {
+    chat_id: msg.chat.id,
+    message_id: statusMsg.message_id,
+    parse_mode: "Markdown",
+  });
 });
 
 // Callback queries handler for inline buttons
 bot.on("callback_query", async (callbackQuery) => {
+  if (!isAllowed(callbackQuery.from?.id)) {
+    await bot.answerCallbackQuery(callbackQuery.id, { text: "No autorizado" });
+    return;
+  }
   const message = callbackQuery.message;
   const data = callbackQuery.data;
+  if (!message || !data) {
+    await bot.answerCallbackQuery(callbackQuery.id);
+    return;
+  }
   const chatId = message.chat.id;
 
   if (data.startsWith("set_model:")) {
@@ -755,12 +1434,19 @@ bot.on("callback_query", async (callbackQuery) => {
     } else if (key === "flash") {
       targetModelId = "qwen/qwen3-coder-next";
       targetName = "Qwen 3 Coder";
+    } else if (key === "ds") {
+      targetModelId = "deepseek-flash";
+      targetName = "DeepSeek Flash";
+    } else if (key === "dspro") {
+      targetModelId = "deepseek-v4-pro";
+      targetName = "DeepSeek V4 Pro";
     }
 
     if (targetModelId) {
       activeModels.set(chatId, targetModelId);
       const config = MODELS_CONFIG[targetModelId];
       const balanceStr = await fetchBalance();
+      const dsBalanceStr = await fetchDSBalance();
 
       bot.answerCallbackQuery(callbackQuery.id, { text: `Modelo cambiado a ${targetName}` });
 
@@ -768,23 +1454,10 @@ bot.on("callback_query", async (callbackQuery) => {
                               `• *Modelo Activo:* \`${config.name}\`\n` +
                               `• *ID Técnico:* \`${targetModelId}\`\n` +
                               `• *Precios (1M tokens):* Entrada \`$${config.inputPrice.toFixed(2)}\` | Salida \`$${config.outputPrice.toFixed(2)}\` ${targetModelId === 'google/gemini-2.5-flash' ? '\n🔥 _¡Coste Cero! Llamada directa gratis via tu API Key de Google._' : ''}\n` +
-                              `• *Saldo OpenRouter:* \`${balanceStr}\`\n\n` +
+                              buildBalanceLines(balanceStr, dsBalanceStr) +
                               `👉 *Selecciona un modelo tocando las opciones del panel:*`;
 
-      const updatedInlineKeyboard = [
-        [
-          { text: `🧠 Qwen 3 Max ($0.78/$3.90) ${targetModelId === 'qwen/qwen3-max' ? '✅' : ''}`, callback_data: 'set_model:qwen' }
-        ],
-        [
-          { text: `💻 Claude Code ($3.00/$15.00) ${targetModelId === 'anthropic/claude-sonnet-4.6' ? '✅' : ''}`, callback_data: 'set_model:claude' }
-        ],
-        [
-          { text: `🌐 Gemini 2.5 Flash (Directo - GRATIS) ${targetModelId === 'google/gemini-2.5-flash' ? '✅' : ''}`, callback_data: 'set_model:gemini' }
-        ],
-        [
-          { text: `⚡ Qwen 3 Coder ($0.11/$0.80) ${targetModelId === 'qwen/qwen3-coder-next' ? '✅' : ''}`, callback_data: 'set_model:flash' }
-        ]
-      ];
+      const updatedInlineKeyboard = buildModelKeyboard(targetModelId);
 
       bot.editMessageText(updatedMenuText, {
         chat_id: chatId,
@@ -798,7 +1471,7 @@ bot.on("callback_query", async (callbackQuery) => {
   }
 });
 
-bot.onText(/\/status/, async (msg) => {
+onAuthorizedText(/\/status/, async (msg) => {
   await runStatusCheck(msg.chat.id);
 });
 
@@ -854,18 +1527,29 @@ async function handleHTMLExtraction(chatId, replyText) {
   }
 }
 
-// ─── Local Console Command Runner (Realtime Polling Bridge) ──────────────────
-async function runLocalCommand(chatId, commandText) {
+// ─── Local Safe Action Runner (Realtime Polling Bridge) ──────────────────
+async function runLocalCommand(chatId, rawAction) {
+  const actionName = normalizeActionName(rawAction);
+
+  if (!isAllowedAction(actionName)) {
+    const valid = listAllowedActions().map(a => `\`${a}\``).join(", ");
+    return bot.sendMessage(
+      chatId,
+      `❌ *Acción no permitida por seguridad.*\n\nLa consola de ejecución libre de comandos de shell está deshabilitada.\n\nAcciones seguras de solo lectura admitidas:\n${valid}\n\nEnvía: \`🖥️ help\` para ver la descripción de cada una.`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
   if (!supabase) {
     return bot.sendMessage(chatId, "❌ Supabase no está configurada.");
   }
   
-  const statusMsg = await bot.sendMessage(chatId, `⏳ *Enviando comando a tu PC local...*\n\`${commandText}\``, { parse_mode: "Markdown" });
+  const statusMsg = await bot.sendMessage(chatId, `⏳ *Enviando acción segura a tu PC local...*\n\`${actionName}\``, { parse_mode: "Markdown" });
   
   try {
     const { data, error } = await supabase
       .from("antigravity_local_queue")
-      .insert({ command: commandText, status: "pending" })
+      .insert({ command: actionName, status: "pending" })
       .select()
       .single();
       
@@ -885,7 +1569,7 @@ async function runLocalCommand(chatId, commandText) {
         
       if (pollError) {
         clearInterval(interval);
-        await bot.editMessageText(`❌ *Error al consultar estatus del comando:*\n\`${pollError.message}\``, {
+        await bot.editMessageText(`❌ *Error al consultar estatus de la acción:*\n\`${pollError.message}\``, {
           chat_id: chatId,
           message_id: statusMsg.message_id,
           parse_mode: "Markdown"
@@ -897,8 +1581,8 @@ async function runLocalCommand(chatId, commandText) {
         clearInterval(interval);
         
         const statusIndicator = job.status === "completed" ? "✅" : "❌";
-        const resultHeader = `${statusIndicator} *Consola (PC Local) — ID ${jobId}*\n\n`;
-        const formattedResult = `\`\`\`\n${job.result}\n\`\`\``;
+        const resultHeader = `${statusIndicator} *Acción Local (${actionName}) — ID ${jobId}*\n\n`;
+        const formattedResult = `${job.result}`;
         
         await bot.editMessageText(resultHeader + formattedResult, {
           chat_id: chatId,
@@ -907,7 +1591,7 @@ async function runLocalCommand(chatId, commandText) {
         });
       } else if (attempts >= maxAttempts) {
         clearInterval(interval);
-        await bot.editMessageText(`⚠️ *Tiempo de espera agotado.*\nEl PC local no respondió al comando en 30 segundos. Verifica que \`node antigravity-bridge.js\` esté corriendo en tu PC.`, {
+        await bot.editMessageText(`⚠️ *Tiempo de espera agotado.*\nEl PC local no respondió a la acción en 30 segundos. Verifica que \`node antigravity-bridge.js\` esté corriendo en tu PC.`, {
           chat_id: chatId,
           message_id: statusMsg.message_id,
           parse_mode: "Markdown"
@@ -916,7 +1600,7 @@ async function runLocalCommand(chatId, commandText) {
     }, 1500);
     
   } catch (err) {
-    await bot.editMessageText(`❌ *Error al insertar comando:* \`${err.message}\``, {
+    await bot.editMessageText(`❌ *Error al insertar acción:* \`${err.message}\``, {
       chat_id: chatId,
       message_id: statusMsg.message_id,
       parse_mode: "Markdown"
@@ -947,7 +1631,12 @@ bot.on("message", async (msg) => {
     }
     
     if (!commandText) {
-      bot.sendMessage(chatId, "❌ Por favor escribe un comando después de la 🖥️ (Ej: `🖥️ dir` o `🖥️ git status`).", { parse_mode: "Markdown" });
+      const valid = listAllowedActions().map(a => `• \`🖥️ ${a}\``).join("\n");
+      bot.sendMessage(
+        chatId,
+        `ℹ️ *Acciones de PC Local Disponibles:*\n\n${valid}\n\nEjemplo: \`🖥️ status\` o \`🖥️ help\`.\n⚠️ *Seguridad:* Comandos libres de consola arbitrarios (dir, del, etc.) están deshabilitados.`,
+        { parse_mode: "Markdown" }
+      );
       return;
     }
     
@@ -1080,6 +1769,133 @@ bot.on("message", async (msg) => {
 bot.on("polling_error", (err) => {
   console.error(chalk.red(`[ERROR DE POLLING] ${err.message}`));
 });
+
+// ─── Qoder → Hermes queue consumer (Supabase realtime) ───────────────────
+// Inserts from the MCP bridge (tool `hermes_enqueue`) arrive as new rows in
+// qoder_hermes_queue. This mirrors the Telegram message handler: claim the row
+// atomically, temporarily override activeModels if a model was specified,
+// reuse askAI + safeSendMessage + handleHTMLExtraction, and post the reply back
+// to Telegram. Works in both webhook (Render) and polling (local) modes;
+// whichever instance claims the row first wins via the status='pending' guard.
+const HERMES_INSTANCE_ID = process.env.HERMES_INSTANCE_ID
+  || `${USE_TELEGRAM_WEBHOOK ? "render" : "local"}-${process.pid}`;
+
+// Queue authorization: two layers.
+//   1. `ALLOWED_USER_ID` (Telegram-side, already in .env) — for 1:1 chats, chat_id === user_id,
+//      so `isAllowed(row.chat_id)` mirrors what bot.on("message") enforces.
+//   2. `QODER_ALLOWED_CHAT_IDS` (optional comma-separated) — narrower list specific to inserts
+//      coming from the MCP bridge. If set, a row's chat_id must be in BOTH that list AND pass
+//      isAllowed(). This defends against a compromised SUPABASE_KEY inserting a foreign chat.
+const QODER_ALLOWED_CHAT_IDS = process.env.QODER_ALLOWED_CHAT_IDS
+  ? new Set(process.env.QODER_ALLOWED_CHAT_IDS.split(",").map((s) => Number(s.trim())).filter(Number.isFinite))
+  : null;
+
+function queueAuthorizes(chatId) {
+  if (!isAllowed(chatId)) return { ok: false, reason: "outside ALLOWED_USER_ID" };
+  if (QODER_ALLOWED_CHAT_IDS && !QODER_ALLOWED_CHAT_IDS.has(chatId)) {
+    return { ok: false, reason: "chat_id not in QODER_ALLOWED_CHAT_IDS" };
+  }
+  return { ok: true };
+}
+
+async function subscribeQoderHermesQueue() {
+  if (!supabase) {
+    console.warn(chalk.gray("[QODER QUEUE] Supabase no está configurado; el consumer queda inactivo."));
+    return;
+  }
+  const policy = QODER_ALLOWED_CHAT_IDS
+    ? `ALLOWED_USER_ID=${ALLOWED ?? "abierto"} ∩ QODER_ALLOWED_CHAT_IDS={${[...QODER_ALLOWED_CHAT_IDS].join(", ")}}`
+    : `ALLOWED_USER_ID=${ALLOWED ?? "abierto"} (sin lista específica de Qoder)`;
+  console.log(chalk.gray(`[QODER QUEUE] política de autorización: ${policy}`));
+  // Probe that the queue table exists before subscribing. If the user hasn't
+  // run qoder_hermes_queue.sql yet, we log a clear one-liner instead of a
+  // cryptic realtime error later.
+  const { count, error: probeErr } = await supabase
+    .from("qoder_hermes_queue")
+    .select("*", { count: "exact", head: true });
+  if (probeErr) {
+    console.warn(chalk.yellow(`[QODER QUEUE] tabla qoder_hermes_queue no accesible (${probeErr.message}). Ejecuta D:/AI/Hermes/mcp-server/qoder_hermes_queue.sql en Supabase y reinicia el bot. Consumer NO suscrito.`));
+    return;
+  }
+  console.log(chalk.gray(`[QODER QUEUE] tabla presente; filas actuales: ${count ?? 0}. Suscribiendo realtime…`));
+  supabase
+    .channel("qoder-hermes-queue")
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "qoder_hermes_queue" },
+      async (payload) => {
+        const row = payload.new;
+        if (!row || row.status !== "pending") return;
+
+        // Reject before claiming — a row for an unauthorized chat is marked failed and never runs.
+        const auth = queueAuthorizes(row.chat_id);
+        if (!auth.ok) {
+          console.warn(chalk.yellow(`[QODER QUEUE] fila ${row.id} RECHAZADA: ${auth.reason} (chat ${row.chat_id})`));
+          await supabase
+            .from("qoder_hermes_queue")
+            .update({
+              status: "failed",
+              result: `authz denied: ${auth.reason}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", row.id)
+            .eq("status", "pending");
+          return;
+        }
+
+        // Atomic claim: only the instance whose update returns status='processing' continues.
+        const { data: claimed, error: claimErr } = await supabase
+          .from("qoder_hermes_queue")
+          .update({ status: "processing", updated_at: new Date().toISOString() })
+          .eq("id", row.id)
+          .eq("status", "pending")
+          .select("id, status")
+          .single();
+        if (claimErr || !claimed) {
+          console.log(chalk.gray(`[QODER QUEUE] fila ${row.id} ya la tomó otra instancia.`));
+          return;
+        }
+        console.log(chalk.cyan(`[QODER QUEUE] ${HERMES_INSTANCE_ID} procesando fila ${row.id} (chat ${row.chat_id})`));
+
+        const previousModel = activeModels.get(row.chat_id);
+        const hasPrev = activeModels.has(row.chat_id);
+        if (row.model && MODELS_CONFIG[row.model]) {
+          activeModels.set(row.chat_id, row.model);
+        }
+        try {
+          const reply = await askAI(row.chat_id, row.text);
+          await safeSendMessage(row.chat_id, reply);
+          try { await handleHTMLExtraction(row.chat_id, reply); } catch (_) { /* best-effort */ }
+          await supabase
+            .from("qoder_hermes_queue")
+            .update({
+              status: "done",
+              result: String(reply).slice(0, 4000),
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", row.id);
+          console.log(chalk.green(`[QODER QUEUE] ✔ fila ${row.id} respondida (${reply.length} chars)`));
+        } catch (err) {
+          console.error(chalk.red(`[QODER QUEUE] ✖ fila ${row.id}: ${err.message}`));
+          await supabase
+            .from("qoder_hermes_queue")
+            .update({
+              status: "failed",
+              result: String((err && err.message) || err).slice(0, 500),
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", row.id);
+        } finally {
+          if (hasPrev) activeModels.set(row.chat_id, previousModel);
+          else activeModels.delete(row.chat_id);
+        }
+      }
+    )
+    .subscribe((status) => {
+      console.log(chalk.gray(`[QODER QUEUE] subscription status: ${status}`));
+    });
+}
+subscribeQoderHermesQueue();
 
 async function configureTelegramDelivery() {
   if (!USE_TELEGRAM_WEBHOOK) {

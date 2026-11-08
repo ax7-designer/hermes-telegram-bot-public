@@ -1,6 +1,6 @@
 require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
-const { exec } = require("child_process");
+const { executeSafeAction } = require("./safe-actions");
 const chalk = require("chalk");
 
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -39,51 +39,39 @@ const subscription = supabase
           .update({ status: "executing", updated_at: new Date().toISOString() })
           .eq("id", id);
         
-        console.log(chalk.gray(`[${id}] Ejecutando en consola de Windows...`));
+        console.log(chalk.gray(`[${id}] Evaluando acción segura...`));
 
-        // Execute command in Windows shell
-        exec(command, { timeout: 30000 }, async (error, stdout, stderr) => {
-          let status = "completed";
-          let result = "";
+        // Execute safe predefined action (Arbitrary shell execution is disabled)
+        const outcome = await executeSafeAction(command);
+        let status = outcome.success ? "completed" : "failed";
+        let result = outcome.success ? outcome.result : `Error: ${outcome.error}`;
 
-          if (error) {
-            status = "failed";
-            result = `Error: ${error.message}\n`;
-          }
-          if (stderr) {
-            result += `Stderr: ${stderr}\n`;
-          }
-          if (stdout) {
-            result += stdout;
-          }
+        if (!result) {
+          result = "(La acción se ejecutó con éxito pero no devolvió ninguna salida)";
+        }
 
-          if (!result) {
-            result = "(El comando se ejecutó con éxito pero no devolvió ninguna salida)";
-          }
+        // Truncate output if it exceeds Telegram/Supabase limits (max 3800 chars to be safe)
+        if (result.length > 3800) {
+          result = result.substring(0, 3700) + "\n\n... (Salida truncada debido al límite de caracteres) ...";
+        }
 
-          // Truncate output if it exceeds Telegram/Supabase limits (max 3800 chars to be safe)
-          if (result.length > 3800) {
-            result = result.substring(0, 3700) + "\n\n... (Salida truncada debido al límite de caracteres) ...";
-          }
+        console.log(chalk.blue(`[${id}] Acción finalizada con estatus: `) + (status === "completed" ? chalk.green(status) : chalk.red(status)));
 
-          console.log(chalk.blue(`[${id}] Comando terminado con estatus: `) + (status === "completed" ? chalk.green(status) : chalk.red(status)));
+        // Write results back to Supabase
+        const { error: updateError } = await supabase
+          .from("antigravity_local_queue")
+          .update({
+            status,
+            result,
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", id);
 
-          // Write results back to Supabase
-          const { error: updateError } = await supabase
-            .from("antigravity_local_queue")
-            .update({
-              status,
-              result,
-              updated_at: new Date().toISOString()
-            })
-            .eq("id", id);
-
-          if (updateError) {
-            console.error(chalk.red(`❌ Error al subir resultados a Supabase: ${updateError.message}`));
-          } else {
-            console.log(chalk.green(`[${id}] Resultados sincronizados en la nube.`));
-          }
-        });
+        if (updateError) {
+          console.error(chalk.red(`❌ Error al subir resultados a Supabase: ${updateError.message}`));
+        } else {
+          console.log(chalk.green(`[${id}] Resultados sincronizados en la nube.`));
+        }
       } catch (err) {
         console.error(chalk.red(`❌ Error general procesando comando: ${err.message}`));
       }
