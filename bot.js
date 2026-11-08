@@ -51,8 +51,6 @@ const HTTP_PORT = process.env.PORT || 10000;
 
 // Obsidian vault access (optional — only when OBSIDIAN_VAULT_PATH is set)
 const OBSIDIAN_VAULT_PATH = process.env.OBSIDIAN_VAULT_PATH || null;
-const fs = require("fs");
-const path = require("path");
 
 function readObsidianFile(relativePath) {
   if (!OBSIDIAN_VAULT_PATH) {
