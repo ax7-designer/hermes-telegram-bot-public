@@ -73,6 +73,81 @@ function listObsidianFiles(relativePath = "") {
   }
   return fs.readdirSync(fullPath).filter((f) => f.endsWith(".md"));
 }
+
+// Recursive .md index of the vault (60s cache keeps Telegram replies fast)
+let obsidianIndexCache = { at: 0, files: [] };
+
+function collectObsidianMarkdown() {
+  if (!OBSIDIAN_VAULT_PATH) return [];
+  const now = Date.now();
+  if (now - obsidianIndexCache.at < 60000 && obsidianIndexCache.files.length) {
+    return obsidianIndexCache.files;
+  }
+  const files = [];
+  const walk = (relDir) => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(path.join(OBSIDIAN_VAULT_PATH, relDir), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue; // .git, .obsidian, .trash
+      const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(rel);
+      else if (entry.name.toLowerCase().endsWith(".md")) files.push(rel);
+    }
+  };
+  walk("");
+  obsidianIndexCache = { at: now, files };
+  return files;
+}
+
+function resolveObsidianPath(query) {
+  if (!OBSIDIAN_VAULT_PATH) return null;
+  const clean = String(query || "").trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!clean || clean.includes("..")) return null;
+  const root = path.resolve(OBSIDIAN_VAULT_PATH);
+  const direct = path.resolve(root, clean.endsWith(".md") ? clean : `${clean}.md`);
+  if (!direct.startsWith(root + path.sep)) return null;
+  if (fs.existsSync(direct) && fs.statSync(direct).isFile()) return direct;
+  // Fallback: match by file name anywhere in the vault (shortest path wins)
+  const target = clean.toLowerCase().replace(/\.md$/, "");
+  const hits = collectObsidianMarkdown()
+    .filter((rel) => path.basename(rel, ".md").toLowerCase() === target)
+    .sort((a, b) => a.length - b.length);
+  return hits.length ? path.resolve(root, hits[0]) : null;
+}
+
+function searchObsidianVault(term, maxFiles = 8) {
+  const needle = String(term || "").toLowerCase().trim();
+  if (!needle || !OBSIDIAN_VAULT_PATH) return [];
+  const results = [];
+  for (const rel of collectObsidianMarkdown()) {
+    let content = "";
+    try {
+      content = fs.readFileSync(path.join(OBSIDIAN_VAULT_PATH, rel), "utf-8");
+    } catch {
+      continue;
+    }
+    const lower = content.toLowerCase();
+    let idx = lower.indexOf(needle);
+    if (idx === -1) continue;
+    let total = 0;
+    const snippets = [];
+    while (idx !== -1) {
+      total += 1;
+      if (snippets.length < 2) {
+        const start = Math.max(0, idx - 60);
+        const end = Math.min(content.length, idx + needle.length + 90);
+        snippets.push(content.slice(start, end).replace(/\s+/g, " ").trim());
+      }
+      idx = lower.indexOf(needle, idx + needle.length);
+    }
+    results.push({ rel, total, snippets });
+  }
+  return results.sort((a, b) => b.total - a.total).slice(0, maxFiles);
+}
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || (TOKEN ? TOKEN.split(":")[1].slice(0, 24) : "bot");
 const WEBHOOK_PATH = `/telegram/${WEBHOOK_SECRET}`;
 const WEBHOOK_BASE_URL = process.env.TELEGRAM_WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL || "";
@@ -1132,7 +1207,9 @@ function showHelp(chatId) {
     `🔧 *Ayuda del Bot (ax7.createga)*\n\n` +
     `• *Seleccionar Modelo:* Muestra el panel interactivo táctil para cambiar de IA y ver precios.\n` +
     `• *Comprobar Conexión:* Realiza una prueba rápida de latencia de red.\n` +
-    `• *Limpiar Historial:* Borra la memoria reciente de este chat de forma segura en Supabase.\n\n` +
+    `• *Limpiar Historial:* Borra la memoria reciente de este chat de forma segura en Supabase.\n` +
+    `• *Vault:* \`/vault <archivo>\` lee una nota del vault de Obsidian; sin argumento muestra el índice.\n` +
+    `• *Buscar:* \`/buscar <término>\` busca en todas las notas y devuelve fragmentos con la ruta.\n\n` +
     `💡 *Nota:* Utiliza los botones táctiles del teclado inferior de tu pantalla móvil para una navegación instantánea y sin fricción.`,
     { parse_mode: "Markdown" }
   );
@@ -1340,6 +1417,75 @@ onAuthorizedText(/\/id/, (msg) => {
       `chat_id: ${msg.chat.id}`,
       `user_id: ${msg.from.id}`
     ].join("\n")
+  );
+});
+
+// ─── Obsidian vault queries ───────────────────────────────────────────────────
+const VAULT_REPLY_LIMIT = 3500;
+
+function truncateForTelegram(text, limit = VAULT_REPLY_LIMIT) {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n\n… (truncado: ${text.length} caracteres en total)`;
+}
+
+onAuthorizedText(/\/vault(?:\s+([\s\S]+))?/, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!OBSIDIAN_VAULT_PATH) {
+    return bot.sendMessage(chatId, "⚠️ El vault no está configurado (falta OBSIDIAN_VAULT_PATH).");
+  }
+  const query = (match && match[1] ? match[1] : "").trim();
+  if (!query) {
+    const files = collectObsidianMarkdown();
+    const byFolder = new Map();
+    for (const rel of files) {
+      const folder = rel.includes("/") ? rel.split("/")[0] : "(raíz)";
+      byFolder.set(folder, (byFolder.get(folder) || 0) + 1);
+    }
+    const lines = [...byFolder.entries()].sort((a, b) => b[1] - a[1]).map(([f, n]) => `• ${f} — ${n} notas`);
+    return bot.sendMessage(
+      chatId,
+      [`📚 Vault: ${files.length} notas .md`, "", ...lines, "", "Uso:", "/vault <archivo o ruta>", "Ej: /vault PLAN-Trello-llamas", "/buscar <término>"].join("\n")
+    );
+  }
+  const abs = resolveObsidianPath(query);
+  if (!abs) {
+    const term = query.toLowerCase();
+    const candidates = collectObsidianMarkdown().filter((rel) => rel.toLowerCase().includes(term)).slice(0, 10);
+    const hint = candidates.length ? `\n\nCoincidencias por nombre:\n${candidates.map((c) => `• /vault ${c}`).join("\n")}` : "\n\nIntenta con /buscar <término>.";
+    return bot.sendMessage(chatId, `❌ No encontré \"${query}\".${hint}`);
+  }
+  let content = "";
+  try {
+    content = fs.readFileSync(abs, "utf-8");
+  } catch (err) {
+    return bot.sendMessage(chatId, `❌ No pude leer el archivo: ${err.message}`);
+  }
+  const relative = path.relative(path.resolve(OBSIDIAN_VAULT_PATH), abs).replace(/\\/g, "/");
+  return bot.sendMessage(chatId, truncateForTelegram(`📄 ${relative}\n\n${content}`));
+});
+
+onAuthorizedText(/\/buscar(?:\s+([\s\S]+))?/, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!OBSIDIAN_VAULT_PATH) {
+    return bot.sendMessage(chatId, "⚠️ El vault no está configurado (falta OBSIDIAN_VAULT_PATH).");
+  }
+  const term = (match && match[1] ? match[1] : "").trim();
+  if (!term) {
+    return bot.sendMessage(chatId, "Uso: /buscar <término>\nEj: /buscar trello");
+  }
+  const results = searchObsidianVault(term);
+  if (!results.length) {
+    return bot.sendMessage(chatId, `🔎 Sin coincidencias para \"${term}\" en el vault.`);
+  }
+  const blocks = results.map((r) => {
+    const head = `📄 ${r.rel} (${r.total})`;
+    const body = r.snippets.map((s) => `… ${s} …`).join("\n");
+    return `${head}\n${body}`;
+  });
+  const totalHits = results.reduce((acc, r) => acc + r.total, 0);
+  return bot.sendMessage(
+    chatId,
+    truncateForTelegram(`🔎 \"${term}\" — ${totalHits} coincidencias en ${results.length} archivos\n\n${blocks.join("\n\n")}\n\nAbre una con /vault <ruta>`)
   );
 });
 
