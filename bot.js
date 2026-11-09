@@ -24,6 +24,7 @@ const {
   normalizeActionName,
   listAllowedActions
 } = require("./safe-actions");
+const { renderChatPage } = require("./web-chat");
 
 const TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const OR_KEY  = process.env.OPENROUTER_API_KEY;
@@ -190,6 +191,47 @@ http.createServer((req, res) => {
         console.error(chalk.red(`[WEBHOOK ERR] ${err.message}`));
         res.writeHead(400, { "Content-Type": "text/plain" });
         res.end("BAD REQUEST");
+      }
+    });
+  } else if (req.method === "GET" && (req.url === "/chat" || req.url.startsWith("/chat?"))) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(renderChatPage({ enabled: Boolean(HERMES_PROXY_TOKEN), model: shortModel(MODEL) }));
+  } else if (req.method === "POST" && req.url === "/chat/api/message") {
+    if (!HERMES_PROXY_TOKEN) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "web chat disabled: HERMES_PROXY_TOKEN not configured", type: "not_configured" } }));
+      return;
+    }
+    const gate = proxyAuthorize(req);
+    if (!gate.ok) {
+      res.writeHead(gate.status, { "Content-Type": "application/json", ...(gate.headers || {}) });
+      res.end(JSON.stringify(gate.body));
+      return;
+    }
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", async () => {
+      let parsed;
+      try { parsed = JSON.parse(raw || "{}"); }
+      catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "invalid JSON body", type: "bad_request" } }));
+      }
+      // The web chat reuses the OpenAI proxy's virtual chat range, so history
+      // persists per browser session through the same RLS-allowed bucket.
+      const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+      if (!text || text.length > 4000) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "text required (1-4000 chars)", type: "bad_request" } }));
+      }
+      try {
+        const reply = await askAI(proxyChatIdFrom(req), text);
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ reply }));
+      } catch (err) {
+        console.error(chalk.red(`[WEB CHAT ERR] ${err.message}`));
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: err.message, type: "chat_error" } }));
       }
     });
   } else if (HERMES_PROXY_TOKEN && req.method === "GET" && req.url.startsWith("/v1/models")) {
@@ -1209,7 +1251,8 @@ function showHelp(chatId) {
     `• *Comprobar Conexión:* Realiza una prueba rápida de latencia de red.\n` +
     `• *Limpiar Historial:* Borra la memoria reciente de este chat de forma segura en Supabase.\n` +
     `• *Vault:* \`/vault <archivo>\` lee una nota del vault de Obsidian; sin argumento muestra el índice.\n` +
-    `• *Buscar:* \`/buscar <término>\` busca en todas las notas y devuelve fragmentos con la ruta.\n\n` +
+    `• *Buscar:* \`/buscar <término>\` busca en todas las notas y devuelve fragmentos con la ruta.\n` +
+    `• *Web:* abre la URL del servicio + \`/chat\` para chatear desde el navegador (pide \`HERMES_PROXY_TOKEN\`).\n\n` +
     `💡 *Nota:* Utiliza los botones táctiles del teclado inferior de tu pantalla móvil para una navegación instantánea y sin fricción.`,
     { parse_mode: "Markdown" }
   );
