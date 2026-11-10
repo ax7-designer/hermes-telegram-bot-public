@@ -24,7 +24,12 @@ const {
   normalizeActionName,
   listAllowedActions
 } = require("./safe-actions");
+const {
+  createBraintrustObservability,
+} = require("./braintrust-observability");
 const { renderChatPage } = require("./web-chat");
+
+const braintrustObs = createBraintrustObservability();
 
 const TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const OR_KEY  = process.env.OPENROUTER_API_KEY;
@@ -169,7 +174,8 @@ http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       mode: USE_TELEGRAM_WEBHOOK ? "webhook" : "polling",
-      webhookConfigured: USE_TELEGRAM_WEBHOOK
+      webhookConfigured: USE_TELEGRAM_WEBHOOK,
+      braintrust: braintrustObs.enabled ? "enabled" : "disabled"
     }));
   } else if (USE_TELEGRAM_WEBHOOK && req.method === "POST" && req.url === WEBHOOK_PATH) {
     if (req.headers["x-telegram-bot-api-secret-token"] !== WEBHOOK_SECRET) {
@@ -296,10 +302,13 @@ const openai = new OpenAI({
 // Env: DEEPSEEK_API_KEY. When absent, DeepSeek routes and panel buttons are hidden so existing
 // OpenRouter/Gemini behavior is unchanged.
 const DS_KEY = process.env.DEEPSEEK_API_KEY;
-const deepseek = DS_KEY ? new OpenAI({
+const deepseekClient = DS_KEY ? new OpenAI({
   apiKey: DS_KEY,
   baseURL: "https://api.deepseek.com",
 }) : null;
+// Braintrust wraps the DeepSeek client directly. It records traces asynchronously and
+// does not proxy inference traffic, so DeepSeek remains the sole billing authority.
+const deepseek = deepseekClient ? braintrustObs.wrapClient(deepseekClient) : null;
 function isDeepSeekModel(modelId) {
   return typeof modelId === "string" && modelId.startsWith("deepseek-");
 }
@@ -601,7 +610,7 @@ async function fetchBalance() {
 // Docs: GET https://api.deepseek.com/user/balance with Authorization: Bearer <key>
 // Response shape (2026-11-06): { is_available: true, balance_infos: [{ currency, total_balance, granted_balance, topped_up_balance }] }. Older docs used is_balance_set / balance_info; we accept either.
 // DeepSeek consumes granted_balance FIRST; topped_up_balance is the money the user actually paid.
-async function getDSBalanceRaw() {
+async function getDSBalanceRaw({ recordSnapshot = true } = {}) {
   if (!DS_KEY) return { ok: false, reason: "no_key" };
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3500);
@@ -619,7 +628,7 @@ async function getDSBalanceRaw() {
     if (!list || list.length === 0) return { ok: false, reason: "no_balance_infos", raw: json };
     const info = list[0];
     const toNum = (v) => (v == null ? null : Number(v));
-    return {
+    const result = {
       ok: true,
       currency: info.currency || "USD",
       totalBalance: toNum(info.total_balance),
@@ -627,11 +636,39 @@ async function getDSBalanceRaw() {
       toppedUpBalance: toNum(info.topped_up_balance),
       fetchedAt: new Date().toISOString(),
     };
+    if (recordSnapshot) {
+      void braintrustObs.recordDeepSeekBalance(result, { source: "balance_fetch" });
+    }
+    return result;
   } catch (err) {
     return { ok: false, reason: String((err && err.message) || err) };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+const BRAINTRUST_BALANCE_REFRESH_MS = (() => {
+  const configured = Number(process.env.BRAINTRUST_BALANCE_REFRESH_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 6 * 60 * 60 * 1000;
+})();
+let braintrustBalanceSnapshotInFlight = false;
+
+async function refreshBraintrustBalanceSnapshot() {
+  if (!braintrustObs.enabled || !DS_KEY || braintrustBalanceSnapshotInFlight) return;
+  braintrustBalanceSnapshotInFlight = true;
+  try {
+    const balance = await getDSBalanceRaw({ recordSnapshot: false });
+    await braintrustObs.recordDeepSeekBalance(balance, { source: "scheduled", force: true });
+  } catch (err) {
+    console.error(chalk.yellow(`[BRAINTRUST] balance refresh failed: ${err.message}`));
+  } finally {
+    braintrustBalanceSnapshotInFlight = false;
+  }
+}
+
+if (braintrustObs.enabled && DS_KEY) {
+  setTimeout(() => void refreshBraintrustBalanceSnapshot(), 10_000).unref?.();
+  setInterval(() => void refreshBraintrustBalanceSnapshot(), BRAINTRUST_BALANCE_REFRESH_MS).unref?.();
 }
 
 async function fetchDSBalance() {
