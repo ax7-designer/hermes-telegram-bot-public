@@ -1291,7 +1291,8 @@ function showHelp(chatId) {
     `• *Limpiar Historial:* Borra la memoria reciente de este chat de forma segura en Supabase.\n` +
     `• *Vault:* \`/vault <archivo>\` lee una nota del vault de Obsidian; sin argumento muestra el índice.\n` +
     `• *Buscar:* \`/buscar <término>\` busca en todas las notas y devuelve fragmentos con la ruta.\n` +
-    `• *PC:* \`/pc <acción>\` ejecuta una acción segura en tu computadora (status, git-status, disk-space, health, pendientes-summary).\n\n` +
+    `• *PC:* \`/pc <acción>\` ejecuta una acción segura en tu computadora (status, git-status, disk-space, health, pendientes-summary).\n` +
+    `• *Estrategia:* \`/estrategia\` arma el brief diario para Codex; \`/estrategia propuesta <tema>\` arma el brief de propuesta.\n\n` +
     `💡 *Nota:* Utiliza los botones táctiles del teclado inferior de tu pantalla móvil para una navegación instantánea y sin fricción.`,
     { parse_mode: "Markdown" }
   );
@@ -1587,6 +1588,93 @@ onAuthorizedText(/\/pc(?:@\w+)?(?:\s+([\s\S]+))?/, async (msg, match) => {
     );
   }
   await runLocalCommand(chatId, action);
+});
+
+// ─── Codex strategist briefs (semi-automated: bot prepares, human runs Codex) ──
+function extractTableroPriorities(limit = 6) {
+  try {
+    const abs = resolveObsidianPath("Tablero-ingresos");
+    if (!abs) return [];
+    const lines = fs.readFileSync(abs, "utf-8").split(/\r?\n/);
+    const rows = [];
+    for (const line of lines) {
+      if (/^\|\s*\d+[a-z]?\s*\|/.test(line)) {
+        const cells = line.split("|").map((c) => c.trim()).filter(Boolean);
+        if (cells.length >= 3 && !/^\d+$/.test(cells[1])) {
+          const next = cells[3] ? ` · Sig: ${cells[3].replace(/\[\[|\]\]/g, "")}` : "";
+          rows.push(`${cells[0]}. ${cells[1]} — ${cells[2]}${next}`);
+        }
+      }
+    }
+    return rows.slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+function buildDailyBrief() {
+  const priorities = extractTableroPriorities();
+  const fecha = new Date().toLocaleDateString("es-MX", { timeZone: "America/Cancun", year: "numeric", month: "long", day: "numeric" });
+  return [
+    `BRIEF PARA CODEX — priorización de hoy (${fecha})`,
+    "",
+    "ROL: Eres el estratega de ax7 (freelancer, Mérida, salud mental privada). Español claro, sin adornos.",
+    "",
+    "CONTEXTO (del vault; no inventes datos):",
+    "- Meta: $24,000 MXN/mes con cartera chica; ~24 h/semana de lunes a jueves.",
+    "- Dos fallas estructurales: sobreprometer alcance (corregir con ×1.5) y atorarse en el último 10%.",
+    "- Regla del tablero: un envío o un cobro vale más que cualquier sistema nuevo.",
+    priorities.length ? "" : "- (No pude leer el Tablero-ingresos en este entorno.)",
+    ...(priorities.length ? ["ESTADO DEL TABLERO (extraído hoy):", ...priorities.map((p) => `- ${p}`)] : []),
+    "",
+    "TAREA:",
+    "1) Elige las 3 acciones con mayor probabilidad de cobro esta semana.",
+    "2) Para cada una: siguiente paso físico (mensaje listo para enviar), duración estimada en ráfaga, y riesgo principal.",
+    "3) Cierra con una sola pregunta: qué necesitas de mí para afinar esto.",
+    "",
+    "SALIDA: máximo 300 palabras, lista numerada, sin explicar tu proceso.",
+  ].join("\n");
+}
+
+function buildProposalBrief(tema) {
+  const hits = searchObsidianVault(tema, 5);
+  const contexto = hits.length
+    ? hits.map((h) => `- ${h.rel}: … ${h.snippets[0] || ""} …`).join("\n")
+    : "- (Sin material del cliente en el vault todavía.)";
+  return [
+    `BRIEF PARA CODEX — propuesta: ${tema}`,
+    "",
+    "ROL: Eres el estratega de ax7 (freelancer, Mérida). Propuesta en español claro, tono de mostrador.",
+    "",
+    "CONTEXTO DEL VAULT (fragmentos reales; no inventes cifras):",
+    contexto,
+    "",
+    "REGLAS DURAS:",
+    "- Nunca 'atraer clientes' en salud mental; nunca prometer reducción de inasistencias; nunca 'resultados garantizados'.",
+    "- Estructura PAS (problema, agitación, solución). Alcance cotizado solo Núcleo + Esperado, estimación ×1.5.",
+    "- Incluye 2 rondas de cambios y cobrar como parte de terminado.",
+    "",
+    "TAREA:",
+    "1) Radiografía rápida: qué pide el cliente vs qué implica de verdad (núcleo, esperado, fase 2).",
+    "2) Borrador de propuesta: 3 bloques, precio único con justificación en horas, y qué NO incluye.",
+    "3) Lista de supuestos a confirmar antes de enviar.",
+    "",
+    "SALIDA: máximo 400 palabras, sin explicar tu proceso.",
+  ].join("\n");
+}
+
+onAuthorizedText(/\/estrategia(?:@\w+)?(?:\s+([\s\S]+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!OBSIDIAN_VAULT_PATH) {
+    return bot.sendMessage(chatId, "⚠️ El vault no está configurado (falta OBSIDIAN_VAULT_PATH).");
+  }
+  const arg = (match && match[1] ? match[1] : "").trim();
+  const brief = arg.startsWith("propuesta")
+    ? buildProposalBrief(arg.replace(/^propuesta\s*/i, "").trim() || "nuevo cliente")
+    : buildDailyBrief();
+  const head = "🧭 *Brief listo para Codex*\n\n1. Copia el bloque de abajo.\n2. En tu PC: guarda el archivo `outbox\\codex-brief.md` o corre `RUN-CODEX-BRIEF.bat` (toma el portapapeles).\n3. La respuesta queda en `outbox\\codex-result.md`.\n\n";
+  await bot.sendMessage(chatId, head, { parse_mode: "Markdown" });
+  return bot.sendMessage(chatId, "```\n" + brief + "\n```");
 });
 
 onAuthorizedText(/\/reset/, async (msg) => {
