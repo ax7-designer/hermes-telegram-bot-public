@@ -232,6 +232,49 @@ http.createServer((req, res) => {
         }
       }
     });
+  } else if (req.method === "GET" && (req.url === "/chat" || req.url.startsWith("/chat?"))) {
+    // Web chat UI: HTML page that talks to /chat/api/message below.
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(renderChatPage({ enabled: Boolean(HERMES_PROXY_TOKEN), model: shortModel(MODEL) }));
+  } else if (req.method === "POST" && req.url === "/chat/api/message") {
+    if (!HERMES_PROXY_TOKEN) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "web chat disabled: HERMES_PROXY_TOKEN is not set" } }));
+      return;
+    }
+    const gate = proxyAuthorize(req);
+    if (!gate.ok) {
+      res.writeHead(gate.status, { "Content-Type": "application/json", ...(gate.headers || {}) });
+      res.end(JSON.stringify(gate.body));
+      return;
+    }
+    let chatBody = "";
+    req.on("data", (chunk) => {
+      chatBody += chunk;
+      if (chatBody.length > 64_000) req.destroy();
+    });
+    req.on("end", async () => {
+      try {
+        let parsed = {};
+        try { parsed = JSON.parse(chatBody || "{}"); } catch { parsed = {}; }
+        const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+        if (!text || text.length > 4000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "text is required (1-4000 chars)" } }));
+          return;
+        }
+        const chatId = proxyChatIdFrom(req);
+        const reply = await askAI(chatId, text);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ reply }));
+      } catch (err) {
+        console.error(chalk.red(`[WEB CHAT ERR] ${err.message}`));
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: err.message, type: "web_chat_error" } }));
+        }
+      }
+    });
   } else {
     res.writeHead(404);
     res.end();
