@@ -27,6 +27,7 @@ const {
 const {
   createBraintrustObservability,
 } = require("./braintrust-observability");
+const { renderChatPage } = require("./web-chat");
 
 const braintrustObs = createBraintrustObservability();
 

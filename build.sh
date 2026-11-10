@@ -4,6 +4,9 @@
 
 set -e
 
+echo "==> Installing production dependencies..."
+npm ci --omit=dev --no-audit --no-fund
+
 echo "==> Cloning Obsidian vault..."
 
 if [ -z "$GITHUB_PAT" ]; then
