@@ -28,6 +28,8 @@ const {
   createBraintrustObservability,
 } = require("./braintrust-observability");
 const { renderChatPage } = require("./web-chat");
+const { createQueueHandler } = require("./queue-consumer");
+const { createPcPoller } = require("./pc-poller");
 
 const braintrustObs = createBraintrustObservability();
 
@@ -1915,48 +1917,14 @@ async function runLocalCommand(chatId, rawAction) {
     if (error) throw error;
     
     const jobId = data.id;
-    let attempts = 0;
-    const maxAttempts = 20; // 20 * 1.5s = 30s timeout
-    
-    const interval = setInterval(async () => {
-      attempts++;
-      const { data: job, error: pollError } = await supabase
-        .from("antigravity_local_queue")
-        .select("status, result")
-        .eq("id", jobId)
-        .single();
-        
-      if (pollError) {
-        clearInterval(interval);
-        await bot.editMessageText(`❌ *Error al consultar estatus de la acción:*\n\`${pollError.message}\``, {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: "Markdown"
-        });
-        return;
-      }
-      
-      if (job.status === "completed" || job.status === "failed") {
-        clearInterval(interval);
-        
-        const statusIndicator = job.status === "completed" ? "✅" : "❌";
-        const resultHeader = `${statusIndicator} *Acción Local (${actionName}) — ID ${jobId}*\n\n`;
-        const formattedResult = `${job.result}`;
-        
-        await bot.editMessageText(resultHeader + formattedResult, {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: "Markdown"
-        });
-      } else if (attempts >= maxAttempts) {
-        clearInterval(interval);
-        await bot.editMessageText(`⚠️ *Tiempo de espera agotado.*\nEl PC local no respondió a la acción en 30 segundos. Verifica que \`node antigravity-bridge.js\` esté corriendo en tu PC.`, {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: "Markdown"
-        });
-      }
-    }, 1500);
+    createPcPoller({
+      supabase,
+      editMessageText: bot.editMessageText.bind(bot),
+      chatId,
+      messageId: statusMsg.message_id,
+      actionName,
+      jobId,
+    }).start();
     
   } catch (err) {
     await bot.editMessageText(`❌ *Error al insertar acción:* \`${err.message}\``, {
@@ -2179,73 +2147,17 @@ async function subscribeQoderHermesQueue() {
     .on(
       "postgres_changes",
       { event: "INSERT", schema: "public", table: "qoder_hermes_queue" },
-      async (payload) => {
-        const row = payload.new;
-        if (!row || row.status !== "pending") return;
-
-        // Reject before claiming — a row for an unauthorized chat is marked failed and never runs.
-        const auth = queueAuthorizes(row.chat_id);
-        if (!auth.ok) {
-          console.warn(chalk.yellow(`[QODER QUEUE] fila ${row.id} RECHAZADA: ${auth.reason} (chat ${row.chat_id})`));
-          await supabase
-            .from("qoder_hermes_queue")
-            .update({
-              status: "failed",
-              result: `authz denied: ${auth.reason}`,
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", row.id)
-            .eq("status", "pending");
-          return;
-        }
-
-        // Atomic claim: only the instance whose update returns status='processing' continues.
-        const { data: claimed, error: claimErr } = await supabase
-          .from("qoder_hermes_queue")
-          .update({ status: "processing", updated_at: new Date().toISOString() })
-          .eq("id", row.id)
-          .eq("status", "pending")
-          .select("id, status")
-          .single();
-        if (claimErr || !claimed) {
-          console.log(chalk.gray(`[QODER QUEUE] fila ${row.id} ya la tomó otra instancia.`));
-          return;
-        }
-        console.log(chalk.cyan(`[QODER QUEUE] ${HERMES_INSTANCE_ID} procesando fila ${row.id} (chat ${row.chat_id})`));
-
-        const previousModel = activeModels.get(row.chat_id);
-        const hasPrev = activeModels.has(row.chat_id);
-        if (row.model && MODELS_CONFIG[row.model]) {
-          activeModels.set(row.chat_id, row.model);
-        }
-        try {
-          const reply = await askAI(row.chat_id, row.text);
-          await safeSendMessage(row.chat_id, reply);
-          try { await handleHTMLExtraction(row.chat_id, reply); } catch (_) { /* best-effort */ }
-          await supabase
-            .from("qoder_hermes_queue")
-            .update({
-              status: "done",
-              result: String(reply).slice(0, 4000),
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", row.id);
-          console.log(chalk.green(`[QODER QUEUE] ✔ fila ${row.id} respondida (${reply.length} chars)`));
-        } catch (err) {
-          console.error(chalk.red(`[QODER QUEUE] ✖ fila ${row.id}: ${err.message}`));
-          await supabase
-            .from("qoder_hermes_queue")
-            .update({
-              status: "failed",
-              result: String((err && err.message) || err).slice(0, 500),
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", row.id);
-        } finally {
-          if (hasPrev) activeModels.set(row.chat_id, previousModel);
-          else activeModels.delete(row.chat_id);
-        }
-      }
+      createQueueHandler({
+        supabase,
+        queueAuthorizes,
+        activeModels,
+        modelsConfig: MODELS_CONFIG,
+        askAI,
+        safeSendMessage,
+        handleHTMLExtraction,
+        instanceId: HERMES_INSTANCE_ID,
+        chalk,
+      })
     )
     .subscribe((status) => {
       console.log(chalk.gray(`[QODER QUEUE] subscription status: ${status}`));

@@ -40,7 +40,7 @@ const ALLOWED_ACTIONS = {
       
       return [
         "📊 *Estado del Proceso y Entorno Local*",
-        `• Sistema Operativo: ${os.type()} ${os.release()} (${os.arch()})`,
+        `• Sistema Operativo: \`${os.type()} ${os.release()} (${os.arch()})\``,
         `• Node.js: ${process.version}`,
         `• Uptime del proceso: ${uptimeMin} min`,
         `• Memoria RSS: ${formatMB(memoryUsage.rss)}`,
