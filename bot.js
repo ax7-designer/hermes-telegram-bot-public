@@ -505,10 +505,11 @@ const MODELS_CONFIG = {
 
 // State for active model per chat
 const activeModels = new Map();
+const selectedModels = new Map();
 const secretaryState = createSecretaryState();
 
 function getModelConfig(chatId) {
-  const modelId = activeModels.get(chatId) || MODEL;
+  const modelId = activeModels.get(chatId) || selectedModels.get(chatId) || MODEL;
   return MODELS_CONFIG[modelId] || {
     name: shortModel(modelId),
     short: shortModel(modelId),
@@ -536,11 +537,14 @@ async function loadHistory(chatId) {
       console.log(chalk.gray(`[DB] Buscando historial para chat ${chatId} en Supabase...`));
       const { data, error } = await supabase
         .from('telegram_chat_history')
-        .select('history')
+        .select('history, active_model')
         .eq('chat_id', chatId)
         .maybeSingle();
       
       if (data && data.history) {
+        if (!selectedModels.has(chatId) && data.active_model && MODELS_CONFIG[data.active_model]) {
+          selectedModels.set(chatId, data.active_model);
+        }
         console.log(chalk.green(`[DB] Historial cargado (${data.history.length} mensajes)`));
         conversations.set(chatId, data.history);
         return data.history;
@@ -562,7 +566,8 @@ async function saveHistory(chatId, history) {
         .from('telegram_chat_history')
         .upsert({ 
           chat_id: chatId, 
-          history: history, 
+          history: history,
+          ...(selectedModels.has(chatId) ? { active_model: selectedModels.get(chatId) } : {}),
           updated_at: new Date().toISOString() 
         });
       if (error) throw error;
@@ -785,12 +790,15 @@ async function fetchTodayUsageBreakdown() {
 // ─── Core AI Router (Dual Engine: Google Native SDK / OpenRouter API) ────────
 async function askAI(chatId, userMessage) {
   const history = await loadHistory(chatId);
-  let modelId = activeModels.get(chatId) || MODEL;
+  let modelId = activeModels.get(chatId) || selectedModels.get(chatId) || MODEL;
   
   // Normalizar IDs antiguos
   if (modelId === "google/gemini-3.1-pro-preview") {
     modelId = "google/gemini-2.5-flash";
     activeModels.set(chatId, "google/gemini-2.5-flash");
+    if (selectedModels.get(chatId) === "google/gemini-3.1-pro-preview") {
+      selectedModels.set(chatId, "google/gemini-2.5-flash");
+    }
   }
 
   const config = getModelConfig(chatId);
@@ -819,7 +827,7 @@ async function askAI(chatId, userMessage) {
 
       // Guardar en el historial persistente de Supabase
       history.push({ role: "user", content: userMessage });
-      history.push({ role: "assistant", content: replyText });
+      history.push({ role: "assistant", content: replyText, model: modelId });
       trimHistory(history);
       await saveHistory(chatId, history);
 
@@ -851,7 +859,7 @@ async function askAI(chatId, userMessage) {
 
   const messages = [
     { role: "system", content: getEffectiveSystemPrompt(chatId) },
-    ...history,
+    ...history.map(({ model, ...message }) => message),
   ];
 
   const sdkParams = {
@@ -882,7 +890,7 @@ async function askAI(chatId, userMessage) {
   }
 
   const replyText = response.choices[0]?.message?.content || "_(sin respuesta)_";
-  history.push({ role: "assistant", content: replyText });
+  history.push({ role: "assistant", content: replyText, model: finalModelId });
   trimHistory(history);
   await saveHistory(chatId, history);
 
@@ -1007,10 +1015,11 @@ async function handleHermesProxy(req, res, rawBody) {
   // we still honor it — Qoder BYOK sometimes omits the header and expects chunked SSE anyway.
 
   const virtualChatId = proxyChatIdFrom(req);
+  await loadHistory(virtualChatId);
   // Explicit model in the body wins if we know it. Otherwise fall through to whatever
   // the Telegram panel currently has selected for this virtual chat (defaults to MODEL).
   const requested = parsed.model;
-  let modelId = (requested && MODELS_CONFIG[requested]) ? requested : (activeModels.get(virtualChatId) || MODEL);
+  let modelId = (requested && MODELS_CONFIG[requested]) ? requested : (activeModels.get(virtualChatId) || selectedModels.get(virtualChatId) || MODEL);
   if (!MODELS_CONFIG[modelId]) modelId = MODEL;
   if (modelId === "google/gemini-3.1-pro-preview") modelId = "google/gemini-2.5-flash";
 
@@ -1031,7 +1040,7 @@ async function handleHermesProxy(req, res, rawBody) {
 
   const outbound = [
     { role: "system", content: SYSTEM_PROMPT },
-    ...history,
+    ...history.map(({ model, ...message }) => message),
   ];
 
   const params = {
@@ -1081,7 +1090,7 @@ async function handleHermesProxy(req, res, rawBody) {
         const fallbackMessage = full.choices?.[0]?.message || {};
         const text = fallbackMessage.content || fallbackMessage.reasoning_content || "";
         sendChunk({ id: full.id || firstChunkMeta.id, object: "chat.completion.chunk", created: full.created || created, model: finalModelId, choices: [{ index: 0, delta: { content: text }, finish_reason: "stop" }] });
-        history.push({ role: "assistant", content: text });
+        history.push({ role: "assistant", content: text, model: finalModelId });
         trimHistory(history);
         await saveHistory(virtualChatId, history);
         const hasUsage = Number.isFinite(full.usage?.prompt_tokens)
@@ -1137,7 +1146,7 @@ async function handleHermesProxy(req, res, rawBody) {
       sendChunk({ id: chunkId, object: "chat.completion.chunk", created, model: finalModelId, choices: [{ index: 0, delta: {}, finish_reason: "error" }] });
     }
 
-    history.push({ role: "assistant", content: accumulated });
+    history.push({ role: "assistant", content: accumulated, model: finalModelId });
     trimHistory(history);
     await saveHistory(virtualChatId, history);
     // Streaming responses don't reliably carry a usage object (that would need
@@ -1184,7 +1193,7 @@ async function handleHermesProxy(req, res, rawBody) {
   // reasoning exists (caller's max_tokens was too tight to finish thinking), surface the
   // reasoning so the client never gets a fully blank assistant turn.
   const replyText = rawMsg.content || rawMsg.reasoning_content || "";
-  history.push({ role: "assistant", content: replyText });
+  history.push({ role: "assistant", content: replyText, model: finalModelId });
   trimHistory(history);
   await saveHistory(virtualChatId, history);
 
@@ -1257,10 +1266,13 @@ function buildModelKeyboard(currentModelId) {
 
 // ─── Command Execution Helpers (Visual Actions) ──────────────────────────────────
 async function showModelPanel(chatId) {
-  let currentModelId = activeModels.get(chatId) || MODEL;
+  let currentModelId = activeModels.get(chatId) || selectedModels.get(chatId) || MODEL;
   if (currentModelId === "google/gemini-3.1-pro-preview") {
     currentModelId = "google/gemini-2.5-flash";
     activeModels.set(chatId, "google/gemini-2.5-flash");
+    if (selectedModels.get(chatId) === "google/gemini-3.1-pro-preview") {
+      selectedModels.set(chatId, "google/gemini-2.5-flash");
+    }
   }
 
   const config = getModelConfig(chatId);
@@ -1417,10 +1429,13 @@ async function handleSecretaryIntent(chatId, text) {
 }
 
 async function runStatusCheck(chatId) {
-  let currentModelId = activeModels.get(chatId) || MODEL;
+  let currentModelId = activeModels.get(chatId) || selectedModels.get(chatId) || MODEL;
   if (currentModelId === "google/gemini-3.1-pro-preview") {
     currentModelId = "google/gemini-2.5-flash";
     activeModels.set(chatId, "google/gemini-2.5-flash");
+    if (selectedModels.get(chatId) === "google/gemini-3.1-pro-preview") {
+      selectedModels.set(chatId, "google/gemini-2.5-flash");
+    }
   }
 
   const statusMsg = await bot.sendMessage(chatId, "⏳ Comprobando conexión con la API...");
@@ -1459,7 +1474,7 @@ onAuthorizedText(/\/start/, (msg) => {
   const name = msg.from.first_name || "allí";
   bot.sendMessage(
     msg.chat.id,
-    `🧠 *Qwen/Gemini Online (ax7.createga)*\n\n¡Hola, ${name}! Soy tu asistente estratégico inteligente.\nModelo activo: \`${shortModel(activeModels.get(msg.chat.id) || MODEL)}\`\n\n` +
+    `🧠 *Qwen/Gemini Online (ax7.createga)*\n\n¡Hola, ${name}! Soy tu asistente estratégico inteligente.\nModelo activo: \`${shortModel(activeModels.get(msg.chat.id) || selectedModels.get(msg.chat.id) || MODEL)}\`\n\n` +
     `He configurado tu teclado con *botones táctiles persistentes* abajo. ¡Ya no necesitas escribir comandos con "/"!\n\n` +
     `Toca cualquier opción para interactuar de forma fluida y visual. 🚀`,
     {
@@ -1680,6 +1695,7 @@ onAuthorizedText(/\/estrategia(?:@\w+)?(?:\s+([\s\S]+))?/, async (msg, match) =>
 });
 
 onAuthorizedText(/\/reset/, async (msg) => {
+  await loadHistory(msg.chat.id);
   await saveHistory(msg.chat.id, []);
   bot.sendMessage(
     msg.chat.id,
@@ -1804,7 +1820,10 @@ bot.on("callback_query", async (callbackQuery) => {
     }
 
     if (targetModelId) {
+      const history = await loadHistory(chatId);
+      selectedModels.set(chatId, targetModelId);
       activeModels.set(chatId, targetModelId);
+      await saveHistory(chatId, history);
       const config = MODELS_CONFIG[targetModelId];
       const balanceStr = await fetchBalance();
       const dsBalanceStr = await fetchDSBalance();
@@ -1996,6 +2015,7 @@ bot.on("message", async (msg) => {
       return;
     }
     if (msg.text === "🔄 Limpiar Historial") {
+      await loadHistory(chatId);
       await saveHistory(chatId, []);
       bot.sendMessage(chatId, "🔄 *Conversación restablecida.*\nHistorial limpiado. ¡Empecemos de cero!", { parse_mode: "Markdown" });
       return;
