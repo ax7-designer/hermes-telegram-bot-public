@@ -1,6 +1,7 @@
 require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
 const { executeSafeAction } = require("./safe-actions");
+const { REPORT_PREFIX } = require("./pc-report");
 const chalk = require("chalk");
 
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -30,6 +31,7 @@ const subscription = supabase
     },
     async (payload) => {
       const { id, command } = payload.new;
+      if (typeof command === "string" && command.startsWith(REPORT_PREFIX)) return;
       console.log(chalk.yellow(`\n📥 Nuevo comando recibido [ID: ${id}]: `) + chalk.green(command));
       
       try {

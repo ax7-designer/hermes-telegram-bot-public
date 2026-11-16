@@ -30,6 +30,7 @@ const {
 const { renderChatPage } = require("./web-chat");
 const { createQueueHandler } = require("./queue-consumer");
 const { createPcPoller } = require("./pc-poller");
+const { createReportCommand } = require("./pc-report");
 
 const braintrustObs = createBraintrustObservability();
 
@@ -1305,7 +1306,7 @@ function showHelp(chatId) {
     `• *Limpiar Historial:* Borra la memoria reciente de este chat de forma segura en Supabase.\n` +
     `• *Vault:* \`/vault <archivo>\` lee una nota del vault de Obsidian; sin argumento muestra el índice.\n` +
     `• *Buscar:* \`/buscar <término>\` busca en todas las notas y devuelve fragmentos con la ruta.\n` +
-    `• *PC:* \`/pc <acción>\` ejecuta una acción segura en tu computadora (status, git-status, disk-space, health, pendientes-summary).\n` +
+    `• *PC:* \`/pc <acción>\` ejecuta una acción segura en tu computadora (status, git-status, disk-space, health, pendientes-summary); \`/pc informe\` lee el informe activo en Edge.\n` +
     `• *Estrategia:* \`/estrategia\` arma el brief diario para Codex; \`/estrategia propuesta <tema>\` arma el brief de propuesta.\n\n` +
     `💡 *Nota:* Utiliza los botones táctiles del teclado inferior de tu pantalla móvil para una navegación instantánea y sin fricción.`,
     { parse_mode: "Markdown" }
@@ -1600,9 +1601,13 @@ onAuthorizedText(/\/pc(?:@\w+)?(?:\s+([\s\S]+))?/, async (msg, match) => {
     const valid = listAllowedActions().map(a => `• \`/pc ${a}\``).join("\n");
     return bot.sendMessage(
       chatId,
-      `🖥️ *Orquestador local*\n\n${valid}\n\nEjemplo: \`/pc status\``,
+      `🖥️ *Orquestador local*\n\n${valid}\n• \`/pc informe\` (solo lectura, pestaña activa de Edge)\n\nEjemplo: \`/pc status\``,
       { parse_mode: "Markdown" }
     );
+  }
+  if (action.toLowerCase() === "informe") return runPcReport(msg);
+  if (/^informe(?:\s|$)/i.test(action)) {
+    return bot.sendMessage(chatId, "Envía exactamente `/pc informe`; deja abierto el informe en la pestaña activa de Edge.", { parse_mode: "Markdown" });
   }
   await runLocalCommand(chatId, action);
 });
@@ -1950,6 +1955,43 @@ async function runLocalCommand(chatId, rawAction) {
       chat_id: chatId,
       message_id: statusMsg.message_id,
       parse_mode: "Markdown"
+    });
+  }
+}
+
+async function runPcReport(msg) {
+  const chatId = msg.chat.id;
+  if (msg.chat.type !== "private" || chatId !== msg.from?.id) {
+    return bot.sendMessage(chatId, "`/pc informe` solo está disponible en tu chat privado con Hermes.", { parse_mode: "Markdown" });
+  }
+  if (!supabase) return bot.sendMessage(chatId, "❌ Supabase no está configurada.");
+
+  const statusMsg = await bot.sendMessage(
+    chatId,
+    "⏳ Leeré solo el informe que ya está abierto en la pestaña activa de Edge. Devolveré total, rango y origen.",
+  );
+  try {
+    const { data, error } = await supabase
+      .from("antigravity_local_queue")
+      .insert({ command: createReportCommand(chatId), status: "pending" })
+      .select("id")
+      .single();
+    if (error) throw error;
+
+    createPcPoller({
+      supabase,
+      editMessageText: bot.editMessageText.bind(bot),
+      chatId,
+      messageId: statusMsg.message_id,
+      actionName: "informe",
+      jobId: data.id,
+      maxAttempts: 90,
+    }).start();
+  } catch (err) {
+    console.error(chalk.red(`[PC INFORME] No se pudo encolar: ${err.message}`));
+    await bot.editMessageText("❌ No se pudo enviar la solicitud a tu PC local.", {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
     });
   }
 }
