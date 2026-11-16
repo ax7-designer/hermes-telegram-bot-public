@@ -62,7 +62,11 @@ function createPcPoller({
         } else if (attempt >= maxAttempts) {
           ownsExit = true;
           stop();
-          await editMessageText(`⚠️ *Tiempo de espera agotado.*\nEl PC local no respondió a la acción en 30 segundos. Verifica que \`node antigravity-bridge.js\` esté corriendo en tu PC.`, markdown);
+          const timeoutSeconds = Math.ceil(maxAttempts * intervalMs / 1000);
+          const timeoutText = actionName === "informe"
+            ? `⚠️ *Tiempo de espera agotado.*\nEl consumidor de Harness no respondió en ${timeoutSeconds} segundos. Verifica que Windows siga con la sesión iniciada y que la tarea \`Hermes DSH Edge Report Read Only\` esté activa.`
+            : `⚠️ *Tiempo de espera agotado.*\nEl PC local no respondió a la acción en ${timeoutSeconds} segundos. Verifica que \`node antigravity-bridge.js\` esté corriendo en tu PC.`;
+          await editMessageText(timeoutText, markdown);
         }
       } catch (err) {
         if (stopped && !ownsExit) return;

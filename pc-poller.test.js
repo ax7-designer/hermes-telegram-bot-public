@@ -23,13 +23,15 @@ test("PC poller offline", async (suite) => {
   const completedText = "✅ *Acción Local (status) — ID 3*\n\n" + result;
 
   function setup({ job = { status: "completed", result }, pollError = null,
-    rejection, editErrors = [], actionName = "status" } = {}) {
+    rejection, editErrors = [], actionName = "status", maxAttempts = 20,
+    intervalMs = 1500 } = {}) {
     const edits = [];
     const cleared = [];
     let polls = 0;
     let tick;
     const poller = createPcPoller({
       chatId: 42, messageId: 7, actionName, jobId: 3,
+      maxAttempts, intervalMs,
       supabase: {
         from(table) {
           assert.equal(table, "antigravity_local_queue");
@@ -57,7 +59,7 @@ test("PC poller offline", async (suite) => {
       },
       timers: {
         setInterval(callback, ms) {
-          assert.equal(ms, 1500);
+          assert.equal(ms, intervalMs);
           tick = callback;
           return 19;
         },
@@ -142,12 +144,23 @@ test("PC poller offline", async (suite) => {
     assert.deepEqual(run.cleared, [19]);
   });
 
-  await suite.test("timeout preserves the original Markdown message after 20 polls", async () => {
+  await suite.test("legacy timeout explains the local bridge after 20 polls", async () => {
     const run = setup({ job: { status: "pending" } });
     for (let i = 0; i < 20; i++) await run.tick();
     assert.equal(run.polls(), 20);
     assert.deepEqual(run.edits, [[
       "⚠️ *Tiempo de espera agotado.*\nEl PC local no respondió a la acción en 30 segundos. Verifica que `node antigravity-bridge.js` esté corriendo en tu PC.",
+      markdown,
+    ]]);
+    assert.deepEqual(run.cleared, [19]);
+  });
+
+  await suite.test("report timeout reflects its deadline and task name", async () => {
+    const run = setup({ actionName: "informe", job: { status: "pending" }, maxAttempts: 90 });
+    for (let i = 0; i < 90; i++) await run.tick();
+    assert.equal(run.polls(), 90);
+    assert.deepEqual(run.edits, [[
+      "⚠️ *Tiempo de espera agotado.*\nEl consumidor de Harness no respondió en 135 segundos. Verifica que Windows siga con la sesión iniciada y que la tarea `Hermes DSH Edge Report Read Only` esté activa.",
       markdown,
     ]]);
     assert.deepEqual(run.cleared, [19]);

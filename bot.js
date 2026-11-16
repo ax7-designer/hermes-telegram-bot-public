@@ -1925,6 +1925,15 @@ async function runLocalCommand(chatId, rawAction) {
     );
   }
 
+  if (actionName === "help") {
+    const valid = listAllowedActions().map(a => `• \`/pc ${a}\``).join("\n");
+    return bot.sendMessage(
+      chatId,
+      `🛡️ *Acciones locales seguras (solo lectura):*\n${valid}\n\n\`/pc informe\` lee el informe abierto en la pestaña activa de Edge.`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
   if (!supabase) {
     return bot.sendMessage(chatId, "❌ Supabase no está configurada.");
   }

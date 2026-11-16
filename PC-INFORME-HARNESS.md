@@ -21,4 +21,4 @@ Para una tarea real, la sesión CLI debe tener su propia credencial oficial en e
 
 - La sesión debe estar iniciada y el informe visible en Edge. No se probó la pantalla bloqueada; la suspensión pausa el consumidor; después de reiniciar hace falta iniciar sesión para que arranque la tarea de Windows.
 - La sesión Harness puede conservar localmente el historial de la ejecución. El registro de la cola y el mensaje de Telegram conservan solo el resultado solicitado.
-- No se abre un puerto público. La app Desktop no pudo agregar el componente CUA desde Complementos porque el componente Cordis no declara `dsh.bundle`; este piloto usa el perfil CLI/web independiente.
+- El comando `help` responde directamente desde el bot y no necesita un bridge local. No se abre un puerto público. La app Desktop no pudo agregar el componente CUA desde Complementos porque el componente Cordis no declara `dsh.bundle`; este piloto usa el perfil CLI/web independiente.
