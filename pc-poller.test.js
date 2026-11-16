@@ -23,13 +23,13 @@ test("PC poller offline", async (suite) => {
   const completedText = "✅ *Acción Local (status) — ID 3*\n\n" + result;
 
   function setup({ job = { status: "completed", result }, pollError = null,
-    rejection, editErrors = [] } = {}) {
+    rejection, editErrors = [], actionName = "status" } = {}) {
     const edits = [];
     const cleared = [];
     let polls = 0;
     let tick;
     const poller = createPcPoller({
-      chatId: 42, messageId: 7, actionName: "status", jobId: 3,
+      chatId: 42, messageId: 7, actionName, jobId: 3,
       supabase: {
         from(table) {
           assert.equal(table, "antigravity_local_queue");
@@ -76,6 +76,13 @@ test("PC poller offline", async (suite) => {
     await run.tick();
     assert.deepEqual(run.edits, [[completedText, markdown]]);
     assert.deepEqual(run.cleared, [19]);
+  });
+
+  await suite.test("report result contains only its requested fields", async () => {
+    const report = "Total: 12\nRango: enero\nPágina de origen: https://example.com";
+    const run = setup({ actionName: "informe", job: { status: "completed", result: report } });
+    await run.tick();
+    assert.deepEqual(run.edits, [[report, markdown]]);
   });
 
   await suite.test("failed preserves the failure indicator and result", async () => {

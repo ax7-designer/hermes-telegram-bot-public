@@ -48,7 +48,9 @@ function createPcPoller({
           ownsExit = true;
           stop();
           const statusIndicator = job.status === "completed" ? "✅" : "❌";
-          const resultHeader = `${statusIndicator} *Acción Local (${actionName}) — ID ${jobId}*\n\n`;
+          const resultHeader = actionName === "informe"
+            ? ""
+            : `${statusIndicator} *Acción Local (${actionName}) — ID ${jobId}*\n\n`;
           const formattedResult = `${job.result}`;
           const text = resultHeader + formattedResult;
           try {
