@@ -27,12 +27,13 @@ function terminateChild(child) {
 
 function runHeadlessReport() {
   return new Promise((resolve, reject) => {
-    const command = `"${dshCommand}" --profile computer-use-headless --permission-mode read-only --approval-policy never -`;
+    const command = `call "${dshCommand}" --profile computer-use-headless --permission-mode read-only --approval-policy never -`;
     const env = { ...process.env, DSH_HOME: dshHome, DSH_PERMISSION_MODE: "read-only" };
     delete env.DEEPSEEK_API_KEY;
     const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", command], {
       cwd: workspaceRoot,
       windowsHide: true,
+      windowsVerbatimArguments: true,
       env,
       stdio: ["pipe", "pipe", "ignore"],
     });
